@@ -1,0 +1,67 @@
+{
+  "name": "X-HD-Config",
+  "sources": [
+    "src/main.c",
+    "src/smbus_hal.c",
+    "src/ui_terminal.c",
+    "src/input.c",
+    "src/ui_osk.c",
+    "src/ui_edid.c",
+    "src/ui_about.c",
+    "src/ui_cec_remote.c",
+    "src/video_mode_mgr.c",
+    "src/d3d_font.cpp",
+    "src/font_asset.c",
+    "src/xbox_eeprom.c",
+    "src/ui_black_level.c"
+  ],
+  "defaultConfiguration": "Debug",
+  "configurations": {
+    "Debug": {
+      "configuration": "debug",
+      "deployPaths": [
+        "Media"
+      ],
+      "createIso": true,
+      "libraries": [
+        "libd3d8d.lib",
+        "libxgraphicsd.lib",
+        "libxapid.lib",
+        "libcd.lib",
+        "libcppd.lib",
+        "libkerneld.lib",
+        "libcompatd.lib"
+      ],
+      "outputDir": "out/Debug",
+      "imageBuild": {
+        "stackSize": 262144,
+        "debug": true,
+        "noLogo": true,
+        "noLibWarn": true
+      }
+    },
+    "Release": {
+      "configuration": "release",
+      "deployPaths": [
+        "Media"
+      ],
+      "createIso": true,
+      "libraries": [
+        "libd3d8.lib",
+        "libxgraphics.lib",
+        "libxapi.lib",
+        "libc.lib",
+        "libcpp.lib",
+        "libkernel.lib",
+        "libcompat.lib"
+      ],
+      "outputDir": "out/Release",
+      "imageBuild": {
+        "stackSize": 262144,
+        "debug": true,
+        "noLogo": true,
+        "noLibWarn": true
+      }
+    }
+  }
+}

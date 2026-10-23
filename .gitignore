@@ -1,0 +1,5 @@
+.pio/
+bin/
+X-OUT/out/
+X-HD-Config/out/
+__pycache__/

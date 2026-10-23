@@ -1,0 +1,32 @@
+{
+  "name": "X-OUT",
+  "type": "dxt",
+  "sources": [
+    "src/main.c"
+  ],
+  "defaultConfiguration": "Debug",
+  "configurations": {
+    "Debug": {
+      "configuration": "debug",
+      "libraries": [
+        "libxbdmd.lib",
+        "libkerneld.lib",
+        "libcd.lib",
+        "libcompatd.lib",
+        "libxapid.lib"
+      ],
+      "outputDir": "out/Debug"
+    },
+    "Release": {
+      "configuration": "release",
+      "libraries": [
+        "libxbdm.lib",
+        "libkernel.lib",
+        "libc.lib",
+        "libcompat.lib",
+        "libxapi.lib"
+      ],
+      "outputDir": "out/Release"
+    }
+  }
+}
