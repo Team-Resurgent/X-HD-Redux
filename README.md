@@ -7,6 +7,10 @@ optional on-screen overlay. It continues the work of
 
 Do not expect 100% completion, please report issues.
 
+> [!CAUTION]
+> **USE AT YOUR OWN RISK!!! IF YOU HAVE NO WAY TO RECOVER WITH A HARDWARE PROGRAMMER THEN PLEASE
+> WAIT FOR OTHERS TO TEST AND CONFIRM IT WORKS ON YOUR REVISION XBOX FIRST**
+
 > Back up your original firmware (ST-Link) before flashing,
 > and make sure the install works with the stock firmware first.
 
