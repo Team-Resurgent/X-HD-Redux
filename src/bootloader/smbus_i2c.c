@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "smbus_i2c.h"
 #include "stm32.h"
 #include "../shared/debug.h"
@@ -13,12 +14,13 @@ static uint16_t ram_buffer_bank = 0;
 static uint16_t ram_buffer_index = 0;
 static uint8_t ram_buffer[RAM_BUFFER_SIZE];
 static uint32_t ram_buffer_crc = 0;
+static uint8_t flash_status = I2C_HDMI_FLASH_IDLE;   // READ_FLASH_STATUS
 
 // -------------------- Initialization --------------------
 void smbus_i2c_init(void)
 {
     smbus_slave_init();
-    debug_log("SMBus: I2C Slave 0x%02X ready\r\n", I2C_SLAVE_ADDR);
+    debug_log("SMBus: I2C Slave 0x%02X ready\n", I2C_SLAVE_ADDR);
 }
 
 void smbus_slave_on_address(void)
@@ -68,6 +70,10 @@ uint8_t smbus_slave_read(uint8_t cmd, uint8_t prev)
         {
             // Big-endian: CRC1 is bits 31:24 ... CRC4 bits 7:0.
             return (uint8_t)(ram_buffer_crc >> (8u * (I2C_HDMI_COMMAND_READ_RAM_PAGE_CRC4 - cmd)));
+        }
+        case I2C_HDMI_COMMAND_READ_FLASH_STATUS:
+        {
+            return flash_status;
         }
         default:
         {
@@ -129,6 +135,7 @@ void smbus_slave_write(uint8_t cmd, uint8_t value)
             if (value < (BOOTLOADER_SIZE >> FLASH_PAGE_SHIFT) ||
                 value >= (FLASH_TOTAL_SIZE >> FLASH_PAGE_SHIFT))
             {
+                flash_status = I2C_HDMI_FLASH_FAILED;
                 break;
             }
             // Shared erase+write+CRC-verify path (also used by the UART
@@ -136,10 +143,11 @@ void smbus_slave_write(uint8_t cmd, uint8_t value)
             // *now* -- ram_buffer_crc is stale here (it's only ever set by
             // WRITE_READ_PAGE reading a possibly-unrelated page from flash),
             // so compute it fresh over the buffer this call actually flashes.
-            // Return value unchecked here to preserve the prior behaviour --
-            // the SMBus host verifies separately via READ_RAM_PAGE_CRC.
-            flash_program_page_verified(value, ram_buffer, RAM_BUFFER_SIZE,
-                                         crc32_buf(ram_buffer, RAM_BUFFER_SIZE));
+            // The result is READ_FLASH_STATUS; XHDUpdater ignores it and reads
+            // the page's CRC back instead.
+            flash_status = flash_program_page_verified(value, ram_buffer, RAM_BUFFER_SIZE,
+                                                       crc32_buf(ram_buffer, RAM_BUFFER_SIZE))
+                           ? I2C_HDMI_FLASH_OK : I2C_HDMI_FLASH_FAILED;
             break;
         }
         case I2C_HDMI_COMMAND_WRITE_APP_FLASH_MODE:

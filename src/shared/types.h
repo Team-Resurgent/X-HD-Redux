@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __TYPES_H__
 #define __TYPES_H__
 
@@ -28,10 +29,14 @@ typedef enum {
     // Q=Full) on HDMI and DVI alike, for sinks that ignore Q and show 16 as gray. HD and
     // RGB-input detection behave exactly as AUTO.
     COLOR_SPACE_AUTO_SD_RGB_FULL = 5,
+    // YCbCr 4:4:4 out, but through the CSC (an identity table) so the picture controls apply
+    // bit-exact with PASSTHROUGH at neutral. A sink without YCbCr 4:4:4
+    // in its EDID (or DVI) gets RGB Full. Application only.
+    COLOR_SPACE_YCBCR_CSC = 6,
     // Highest valid value -- every range check (user_config load, SMBus write, CLI) uses
     // this, so a new mode can't be silently dropped by a stale bound again (the SMBus
     // check once lagged RGB_PASSTHROUGH this way).
-    COLOR_SPACE_MAX = COLOR_SPACE_AUTO_SD_RGB_FULL
+    COLOR_SPACE_MAX = COLOR_SPACE_YCBCR_CSC
 } adv_color_space;
 
 // Defined once in user_config.c (compiled into both images); a static inline here was

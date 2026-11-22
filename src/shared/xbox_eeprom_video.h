@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __XBOX_EEPROM_VIDEO_H__
 #define __XBOX_EEPROM_VIDEO_H__
 

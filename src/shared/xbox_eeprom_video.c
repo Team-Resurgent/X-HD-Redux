@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "xbox_eeprom_video.h"
 
 #define EEPROM_VS_NTSC_M 0x00400100u

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "smbus_i2c.h"
 #include "../shared/adv7511_i2c.h"
 #include "xbox_video_bios.h"
@@ -12,6 +13,7 @@
 #include "../shared/adv7511_xbox.h"
 #include "../shared/adv7511_edid.h"
 #include "../shared/xbox_video_timing.h"
+#include "../shared/xbox_video_standalone.h"
 #include "../shared/user_config.h"
 
 static SMBusSettings scratchSettings = {0};
@@ -27,14 +29,14 @@ static uint32_t ram_buffer_crc = 0;
 
 // WRITE_RAM_APPLY's actual flash write, deferred out of the I2C2 ISR to main-loop context
 // -- see that case's own comment. Consumed by smbus_consume_flash_write(), called once per
-// main-loop iteration alongside smbus_consume_settings_changes(). Safe for ram_buffer/CRC
-// to be snapshotted here rather than copied: the host updater doesn't start writing a new
-// page into ram_buffer until well after it reads back this page's flash-verified CRC,
-// which is itself well after main-loop cadence would have already consumed this pending
-// write.
+// main-loop iteration alongside smbus_consume_settings_changes(). ram_buffer itself is
+// written, not a copy: WRITE_READ_PAGE is refused while a write is pending, and a host must
+// not send the next page's WRITE_RAM bytes until READ_FLASH_STATUS leaves BUSY (XHDUpdater's
+// one-second waits cover it; X-HD-Config polls the status).
 static volatile bool s_flash_write_pending = false;
 static volatile uint16_t s_flash_write_page = 0;
 static volatile uint32_t s_flash_write_crc = 0;
+static volatile uint8_t s_flash_status = I2C_HDMI_FLASH_IDLE;   // READ_FLASH_STATUS
 
 // Video info (opcodes 22/151): main loop writes s_video_live (IRQs off for the copy); the
 // latch copies it to the session's video_snap, which READ_VIDEO_INFO streams.
@@ -69,6 +71,9 @@ void smbus_note_chip_id(uint8_t id, uint8_t rev)
 // possibly-blocking first EDID read in edid_is_hdmi_sink()) is deferred to the main loop
 // via s_spd_apply_pending -- same reason colour space uses color_space_reapply_pending.
 static volatile bool s_spd_apply_pending = false;
+// Bumped by every packet the freeze ignored: its content isn't used, but it still says the
+// console is in a mode set (see stand_alone_loop()'s mode_change_update()).
+static volatile uint8_t s_frozen_packets;
 
 // Telemetry (opcode 15). Written only from main-loop context (publish/event/note below),
 // read byte-by-byte by the slave ISR via the cursor. Fields are naturally aligned so the
@@ -91,6 +96,8 @@ typedef struct {
     XhdVideoInfo video_snap;             // WRITE_VIDEO_INFO_LATCH's copy of s_video_live
     uint8_t spd_stage[XHD_SPD_NAME_LEN]; // WRITE_SPD_DATA staging
     uint8_t spd_w, spd_r;                // SPD staging / read cursors
+    uint8_t pic_stage[1 + sizeof(procamp_settings)]; // WRITE_PICTURE_DATA staging: profile, settings
+    uint8_t pic_w, pic_r;                // picture staging / read cursors
     uint8_t cec_tx[ADV7511_CEC_MAX_FRAME]; // WRITE_CEC_TX_DATA staging; TX_APPLY queues it
     uint8_t cec_tx_n;                    // CEC Tx staging length
     uint8_t cec_rx_idx;                  // READ_CEC_RX_DATA cursor
@@ -112,7 +119,6 @@ static volatile bool color_space_reapply_pending = false;
 // otherwise acking unconditionally can clear the pending flag a newer ISR
 // write just set, silently dropping that update.
 static volatile uint32_t update_sequence = 0;
-static bool g_smbus_sniff_enabled = false;
 
 // --- Control suite (opcode 13 read, 141-145 write) ---
 // The SMBus ISR only ever touches RAM here: reads come from user config, writes stash a value
@@ -123,38 +129,16 @@ static bool g_smbus_sniff_enabled = false;
 #define SM_DIRTY_PHASE    0x01
 #define SM_DIRTY_ASPECT   0x02
 #define SM_DIRTY_SCAN     0x04
+// SAVE, DEFAULTS, REAPPLY and RELOAD are WRITE_CONFIG_ACTION 1-4, one bit apart in that order.
 #define SM_DIRTY_SAVE     0x08
 #define SM_DIRTY_DEFAULTS 0x10
 #define SM_DIRTY_REAPPLY  0x20
-#define SM_DIRTY_WVIC     0x40
+#define SM_DIRTY_RELOAD   0x40
 #define SM_DIRTY_POSITION 0x80
-#define SM_DIRTY_RELOAD   0x100
+#define SM_DIRTY_WVIC     0x100
 #define SM_DIRTY_AUDIO    0x200
-
-typedef struct {
-    uint8_t is_write;
-    uint8_t cmd;
-    uint8_t val;
-} SniffEvent;
-
-#define SNIFF_QUEUE_SIZE 64
-static SniffEvent sniff_queue[SNIFF_QUEUE_SIZE];
-static volatile uint8_t sniff_head = 0;
-static volatile uint8_t sniff_tail = 0;
-
-
-void smbus_set_sniff(bool enable)
-{
-    g_smbus_sniff_enabled = enable;
-    if (!enable) {
-        sniff_head = sniff_tail = 0;
-    }
-}
-
-bool smbus_get_sniff(void)
-{
-    return g_smbus_sniff_enabled;
-}
+#define SM_DIRTY_PICTURE  0x400
+#define SM_DIRTY_SD_EXACT 0x800
 
 // Freeze is the page-63 smbus_freeze byte (WRITE_FREEZE): live, and applied at boot once saved.
 bool smbus_get_apply_frozen(void)
@@ -162,30 +146,9 @@ bool smbus_get_apply_frozen(void)
     return user_config_get()->smbus_freeze != 0;
 }
 
-// Shared by the read-response and write-data sniff-recording sites below.
-static void sniff_record(uint8_t is_write, uint8_t cmd, uint8_t val)
+uint8_t smbus_frozen_packet_count(void)
 {
-    if (!g_smbus_sniff_enabled) return;
-    uint8_t next = (uint8_t)((sniff_head + 1) % SNIFF_QUEUE_SIZE);
-    if (next != sniff_tail) {
-        sniff_queue[sniff_head].is_write = is_write;
-        sniff_queue[sniff_head].cmd = cmd;
-        sniff_queue[sniff_head].val = val;
-        sniff_head = next;
-    }
-}
-
-void smbus_poll_sniffer(void)
-{
-    while (sniff_head != sniff_tail) {
-        SniffEvent ev = sniff_queue[sniff_tail];
-        sniff_tail = (uint8_t)((sniff_tail + 1) % SNIFF_QUEUE_SIZE);
-        if (ev.is_write) {
-            debug_log("[SNIFF] W %02X(%u)=%02X\r\n", ev.cmd, ev.cmd, ev.val);
-        } else {
-            debug_log("[SNIFF] R %02X(%u)>%02X\r\n", ev.cmd, ev.cmd, ev.val);
-        }
-    }
+    return s_frozen_packets;
 }
 
 // -------------------- Initialization --------------------
@@ -195,7 +158,7 @@ void smbus_i2c_init(void)
     // The passive probe's EXTI on these pins was set up by smbus_probe_early_init() (main()
     // runs it first) and keeps working across this switch to AF1.
     smbus_slave_init();
-    debug_log("SMBus: slave %02X ready\r\n", I2C_SLAVE_ADDR);
+    debug_log(LOG_SMBUS_SLAVE_READY, I2C_SLAVE_ADDR);
 }
 
 // The byte at a block's read cursor; the cursor advances and wraps at the block's size.
@@ -263,6 +226,11 @@ static uint8_t smbus_read_byte(smbus_session_t *s, uint8_t cmd, uint8_t prev)
             r = (uint8_t)(ram_buffer_crc >> (8u * (I2C_HDMI_COMMAND_READ_RAM_PAGE_CRC4 - cmd)));
             break;
         }
+        case I2C_HDMI_COMMAND_READ_FLASH_STATUS:
+        {
+            r = s_flash_status;
+            break;
+        }
         case I2C_HDMI_COMMAND_READ_COLOR_SPACE:
         {
             r = (uint8_t)adv7511_get_color_space();
@@ -300,7 +268,8 @@ static uint8_t smbus_read_byte(smbus_session_t *s, uint8_t cmd, uint8_t prev)
         case I2C_HDMI_COMMAND_READ_LIVE_FLAGS:
         {
             r = (uint8_t)((adv7511_audio_mute_held() ? 0x01 : 0x00) |
-                          (user_config_get()->smbus_freeze ? 0x02 : 0x00));
+                          (user_config_get()->smbus_freeze ? 0x02 : 0x00) |
+                          (adv7511_cec_tv_standby() ? 0x04 : 0x00));
             break;
         }
         case I2C_HDMI_COMMAND_READ_USER_CONFIG:
@@ -325,7 +294,7 @@ static uint8_t smbus_read_byte(smbus_session_t *s, uint8_t cmd, uint8_t prev)
             r = (uint8_t)(adv7511_cec_tx_status() | (rx_pending ? 0x10 : 0x00) |
                                      (user_config_get()->cec_clock_off ? 0x00 : 0x20) |
                                      (user_config_get()->cec_one_touch_off ? 0x00 : 0x40) |
-                                     (user_config_get()->cec_standby_off ? 0x00 : 0x80));
+                                     (user_config_get()->cec_standby_off == 1 ? 0x00 : 0x80));
             break;
         }
         case I2C_HDMI_COMMAND_READ_CEC_RX_LEN:
@@ -338,6 +307,11 @@ static uint8_t smbus_read_byte(smbus_session_t *s, uint8_t cmd, uint8_t prev)
         case I2C_HDMI_COMMAND_READ_SPD_DATA:
         {
             r = read_cursor(user_config_get_spd(), &s->spd_r, XHD_SPD_NAME_LEN);
+            break;
+        }
+        case I2C_HDMI_COMMAND_READ_PICTURE:
+        {
+            r = read_cursor(user_config_picture(), &s->pic_r, sizeof(xhd_picture_live));
             break;
         }
         case I2C_HDMI_COMMAND_READ_CEC_RX_DATA:
@@ -401,19 +375,21 @@ static void smbus_write_byte(smbus_session_t *s, uint8_t cmd, uint8_t value)
             {
                 if (user_config_get()->smbus_freeze)
                 {
-                    debug_ring_log("SMBus: IGNORED (frozen) mode=%08X\r\n", scratchSettings.mode);
+                    debug_ring_log(LOG_SMBUS_FROZEN, scratchSettings.mode);
+                    s_frozen_packets++;
                 }
                 else
                 {
                     memcpy(&settings, &scratchSettings, sizeof(SMBusSettings));
+                    ISR_BARRIER();
                     video_mode_update_pending = true;
                     update_sequence++;
-                    debug_ring_log("SMBus: encoder=%02X region=%02X mode=%08X title=%08X avinfo=%08X\r\n", settings.encoder, settings.region, settings.mode, settings.titleid, settings.avinfo);
+                    debug_ring_log(LOG_SMBUS_PACKET, settings.encoder, settings.region, settings.mode, settings.titleid, settings.avinfo);
                 }
             }
             else
             {
-                debug_ring_log("SMBus: CONFIG_APPLY bad value=%02X\r\n", value);
+                debug_ring_log(LOG_SMBUS_APPLY_BAD, value);
             }
             break;
         }
@@ -430,7 +406,9 @@ static void smbus_write_byte(smbus_session_t *s, uint8_t cmd, uint8_t value)
             // (0-63, including the bootloader's own region -- reading it back for
             // verification is legitimate, unlike writing) is fine; anything higher
             // multiplies out past the actual flash and reads undefined memory.
-            if (value >= (FLASH_TOTAL_SIZE >> FLASH_PAGE_SHIFT))
+            // Also refused while a RAM_APPLY is queued: the copy would replace the buffer
+            // the main loop is about to write.
+            if (value >= (FLASH_TOTAL_SIZE >> FLASH_PAGE_SHIFT) || s_flash_write_pending)
             {
                 break;
             }
@@ -462,14 +440,13 @@ static void smbus_write_byte(smbus_session_t *s, uint8_t cmd, uint8_t value)
         // The application writes only the BOOTLOADER's pages (0-19): the mirror
         // image of bootloader/smbus_i2c.c, which writes only application pages
         // (20-63). Each side rewrites the other, never the image it is running
-        // from. XHDUpdater's HD+ -> X-HD conversion (updater/src/XHDUpdater/
-        // Main.cpp HDPlusProcess()) flashes the X-HD application through the HD+
-        // bootloader, switches to Application mode, then calls
-        // HDHelper::FlashBootloader() -- pages 0-19 through THIS handler, retrying
-        // each page until its read-back CRC matches. 660fe41 flipped this range to
-        // 20-63, which made that loop retry forever and let the running
-        // application erase its own code. Safe while running: the vector table
-        // lives in SRAM (relocate_vector_table_to_ram()), not on page 0.
+        // from. XHDUpdater's HD+ -> X-HD conversion depends on it: it flashes this
+        // application through the HD+ bootloader, switches to Application mode, then
+        // rewrites pages 0-19 through THIS handler, retrying each page until its
+        // read-back CRC matches. Writing pages 20-63 here instead would never match
+        // (the running application would be erasing its own code), so that loop would
+        // retry forever. Safe while running: the vector table lives in SRAM
+        // (relocate_vector_table_to_ram()), not on page 0.
         // The actual erase/write is deferred to main-loop context
         // (smbus_consume_flash_write(), matching WRITE_CONFIG_APPLY's own pattern)
         // rather than run here in the ISR, since flash_erase_page()/
@@ -479,11 +456,13 @@ static void smbus_write_byte(smbus_session_t *s, uint8_t cmd, uint8_t value)
         {
             if (value >= (BOOTLOADER_SIZE >> FLASH_PAGE_SHIFT))
             {
+                s_flash_status = I2C_HDMI_FLASH_FAILED;
                 break;
             }
             s_flash_write_page = value;
             s_flash_write_crc = crc32_buf(ram_buffer, RAM_BUFFER_SIZE);
             s_flash_write_pending = true;
+            s_flash_status = I2C_HDMI_FLASH_BUSY;
             break;
         }
         case I2C_HDMI_COMMAND_WRITE_COLOR_SPACE:
@@ -496,10 +475,11 @@ static void smbus_write_byte(smbus_session_t *s, uint8_t cmd, uint8_t value)
                 // (or reboot after one) keeps this choice instead of the stale
                 // Page 63 value.
                 user_config_get()->color_space = value;
+                ISR_BARRIER();
                 color_space_reapply_pending = true;
                 // The setting's number, not its name: naming Auto resolves it, which can
                 // read the EDID over I2C1 -- not from this ISR.
-                debug_ring_log("SMBus: color %u\r\n", value);
+                debug_ring_log(LOG_SMBUS_COLOR, value);
             }
             break;
         }
@@ -521,20 +501,34 @@ static void smbus_write_byte(smbus_session_t *s, uint8_t cmd, uint8_t value)
             }
             break;
         }
+        case I2C_HDMI_COMMAND_WRITE_SD_EXACT:
+        {
+            if (value <= 1)
+            {
+                user_config_get()->sd_exact = value;
+                s->dirty |= SM_DIRTY_SD_EXACT;
+            }
+            break;
+        }
         case I2C_HDMI_COMMAND_WRITE_CEC_CLOCK_OUT:
         case I2C_HDMI_COMMAND_WRITE_CEC_ONE_TOUCH:
         case I2C_HDMI_COMMAND_WRITE_CEC_STANDBY:
         {
             // The main loop follows all three (cec_clock_out_follow_config(), the
             // supervisor's One Touch Play call and shutdown check).
-            if (value <= 1)
+            if (cmd == I2C_HDMI_COMMAND_WRITE_CEC_STANDBY)
+            {
+                // Wire 1 = restore (pre-mode "on"), 0 = nothing, 2 = always <Standby>;
+                // stored as 0/1/2 (user_config.h) so old writers keep working.
+                if (value <= 2)
+                    user_config_get()->cec_standby_off = (uint8_t)(value == 1 ? 0 : (value == 0 ? 1 : 2));
+            }
+            else if (value <= 1)
             {
                 if (cmd == I2C_HDMI_COMMAND_WRITE_CEC_CLOCK_OUT)
                     user_config_get()->cec_clock_off = (uint8_t)!value;   // stored inverted
-                else if (cmd == I2C_HDMI_COMMAND_WRITE_CEC_ONE_TOUCH)
-                    user_config_get()->cec_one_touch_off = (uint8_t)!value;
                 else
-                    user_config_get()->cec_standby_off = (uint8_t)!value;
+                    user_config_get()->cec_one_touch_off = (uint8_t)!value;
             }
             break;
         }
@@ -654,10 +648,32 @@ static void smbus_write_byte(smbus_session_t *s, uint8_t cmd, uint8_t value)
             if (value == 0x01 && s->spd_w == XHD_SPD_NAME_LEN &&
                 user_config_set_spd(s->spd_stage))
             {
+                ISR_BARRIER();
                 s_spd_apply_pending = true;
             }
             s->spd_w = 0;   // either way, re-arm for the next name
             s->spd_r = 0;
+            break;
+        }
+        case I2C_HDMI_COMMAND_WRITE_PICTURE_DATA:
+        {
+            if (s->pic_w < sizeof(s->pic_stage))
+            {
+                s->pic_stage[s->pic_w++] = value;
+            }
+            break;
+        }
+        case I2C_HDMI_COMMAND_WRITE_PICTURE_APPLY:
+        {
+            // As WRITE_SPD_APPLY: only a complete, in-range block; the CSC and clip rewrite is
+            // the main loop's (adv7511_apply_picture()).
+            if (value == 0x01 && s->pic_w == sizeof(s->pic_stage) &&
+                user_config_set_picture(s->pic_stage))
+            {
+                s->dirty |= SM_DIRTY_PICTURE;
+            }
+            s->pic_w = 0;
+            s->pic_r = 0;
             break;
         }
         case I2C_HDMI_COMMAND_WRITE_CEC_RX_ACK:
@@ -667,25 +683,18 @@ static void smbus_write_byte(smbus_session_t *s, uint8_t cmd, uint8_t value)
                 adv7511_cec_rx_release();
                 s->cec_rx_idx = 0;
             }
+            else if (value == 0x02)
+            {
+                adv7511_cec_tv_standby_clear();   // the BIOS has acted on the TV's <Standby>
+            }
             break;
         }
         case I2C_HDMI_COMMAND_WRITE_CONFIG_ACTION:
         {
-            if (value == 0x01)
+            // 1 save, 2 defaults, 3 reapply, 4 reload (the bits are in that order).
+            if ((uint8_t)(value - 1u) < 4u)
             {
-                s->dirty |= SM_DIRTY_SAVE;
-            }
-            else if (value == 0x02)
-            {
-                s->dirty |= SM_DIRTY_DEFAULTS;
-            }
-            else if (value == 0x03)
-            {
-                s->dirty |= SM_DIRTY_REAPPLY;
-            }
-            else if (value == 0x04)
-            {
-                s->dirty |= SM_DIRTY_RELOAD;
+                s->dirty |= (uint16_t)(SM_DIRTY_SAVE << (value - 1u));
             }
             break;
         }
@@ -732,22 +741,24 @@ void smbus_slave_on_address(void)
 uint8_t smbus_slave_read(uint8_t cmd, uint8_t prev)
 {
     const uint8_t r = smbus_read_byte(&s_smbus, cmd, prev);
-    sniff_record(0, cmd, r);
     return r;
 }
 
 void smbus_slave_write(uint8_t cmd, uint8_t value)
 {
     smbus_write_byte(&s_smbus, cmd, value);
-    sniff_record(1, cmd, value);
 }
 
 bool video_mode_updated() {
-    return video_mode_update_pending;
+    const bool pending = video_mode_update_pending;
+    ISR_BARRIER();   // getSMBusSettings() is read after this
+    return pending;
 }
 
 uint32_t get_video_mode_update_sequence() {
-    return update_sequence;
+    const uint32_t seq = update_sequence;
+    ISR_BARRIER();
+    return seq;
 }
 
 void ack_video_mode_update(uint32_t seen_sequence) {
@@ -766,6 +777,7 @@ const SMBusSettings * getSMBusSettings() {
 bool smbus_consume_spd_apply_pending(void) {
     if (s_spd_apply_pending) {
         s_spd_apply_pending = false;
+        ISR_BARRIER();   // the caller reads the new name next
         return true;
     }
     return false;
@@ -774,6 +786,7 @@ bool smbus_consume_spd_apply_pending(void) {
 bool consume_color_space_reapply_pending(void) {
     if (color_space_reapply_pending) {
         color_space_reapply_pending = false;
+        ISR_BARRIER();
         return true;
     }
     return false;
@@ -863,13 +876,24 @@ void smbus_consume_flash_write(void) {
         return;
     }
 
-    flash_program_page_verified(page, ram_buffer, RAM_BUFFER_SIZE, crc);
+    s_flash_status = flash_program_page_verified(page, ram_buffer, RAM_BUFFER_SIZE, crc)
+                     ? I2C_HDMI_FLASH_OK : I2C_HDMI_FLASH_FAILED;
+}
+
+// A settings change's wire-VIC mode registers -- now, unless a mode change is under way: its
+// judgment is of the applied (old) raster on the last clock, and the old 720x480's VIC 2 went
+// out on a 1080i burst. Every caller queues a
+// re-apply, whose apply programs them for the new raster.
+static void settings_wire_vic_mode(void) {
+    if (stand_alone_owner_settled()) {
+        adv7511_apply_wire_vic_mode();
+    }
 }
 
 // Drains the control-suite write requests both sessions stashed (the console's from the ISR,
-// the UART bridge's from the main loop). Called from bios_loop() (main-loop context) so register
-// writes, flash saves and mode reapplies happen off-ISR. Flags merge; where both sessions set the
-// same value, the UART's (the more recent manual action) wins.
+// the UART bridge's from the main loop). Called from video_supervisor_step() (main-loop context)
+// so register writes, flash saves and mode reapplies happen off-ISR. Flags merge; where both
+// sessions set the same value, the UART's (the more recent manual action) wins.
 void smbus_consume_settings_changes(const xbox_encoder xb_encoder) {
     __disable_irq();
     const uint16_t c_dirty = s_smbus.dirty;
@@ -904,7 +928,10 @@ void smbus_consume_settings_changes(const xbox_encoder xb_encoder) {
         // The load touches no register: the saved phase goes on with the encoder setup.
         if (user_config_load()) {
             init_adv_encoder_specific(xb_encoder);
-            reapply_active_mode(xb_encoder);
+            settings_wire_vic_mode();
+            // A same-raster reapply rewrites the CSC only for a new colour space.
+            adv7511_apply_picture();
+            request_reapply();
         }
         return;
     }
@@ -919,7 +946,11 @@ void smbus_consume_settings_changes(const xbox_encoder xb_encoder) {
         // the whole struct and persists it, then reapplies once.
         user_config_restore_defaults(xb_encoder);
         user_config_save();
-        reapply_active_mode(xb_encoder);
+        // The wire-VIC mode may have changed with it: the chip kept auto's 0x3B, and honest
+        // mode declared auto's VIC 2 on Focus 0x02's 29.455 MHz, which is not VIC 2's clock.
+        settings_wire_vic_mode();
+        adv7511_apply_picture();
+        request_reapply();
         return;
     }
 
@@ -931,20 +962,29 @@ void smbus_consume_settings_changes(const xbox_encoder xb_encoder) {
         xbox_position(xb_encoder, false, &pos_v, NULL, true);
     }
     if (dirty & SM_DIRTY_WVIC) {
-        adv7511_apply_wire_vic_mode();
+        settings_wire_vic_mode();
+    }
+    if (dirty & SM_DIRTY_PICTURE) {
+        adv7511_apply_picture();
     }
     // scan_mode affects HD too; aspect_ratio is SD-only, so a lone aspect change while an
     // HD mode is live needs no reapply (the setting is stored and applies on the next SD
-    // mode).
-    bool want_reapply = (dirty & (SM_DIRTY_SCAN | SM_DIRTY_REAPPLY | SM_DIRTY_WVIC)) != 0;
-    if (dirty & SM_DIRTY_ASPECT) {
-        uint8_t bvic = adv7511_read_active_vic();
-        if (!vic_is_hd(bvic)) {
-            want_reapply = true;
-        }
+    // mode). Only a BIOS-owned SD mode reapplies: in standalone the arbiter reads the new
+    // setting on its next pass and re-aspects in place. A reapply there put the old VIC's
+    // aspect back on 720x480 (VIC 2/3) before the arbiter fixed it, and on VIC 1 its blind
+    // fallback re-applied its latched old aspect in between (new -> old -> new).
+    bool want_reapply = (dirty & (SM_DIRTY_SCAN | SM_DIRTY_REAPPLY | SM_DIRTY_WVIC | SM_DIRTY_SD_EXACT)) != 0;
+    // A forced re-apply is for repairs: the full apply, in a TMDS cycle, even on the same
+    // raster (a settings re-apply writes only what changed).
+    if (dirty & SM_DIRTY_REAPPLY) {
+        adv7511_request_full_apply();
+    }
+    if ((dirty & SM_DIRTY_ASPECT) && adv7511_active_mode_is_bios() &&
+        !vic_is_hd(adv7511_read_active_vic())) {
+        want_reapply = true;
     }
     if (want_reapply) {
-        reapply_active_mode(xb_encoder);
+        request_reapply();
     }
     if (dirty & SM_DIRTY_SAVE) {
         user_config_save();

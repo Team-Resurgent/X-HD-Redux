@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "video_mode_mgr.h"
 #include <stdio.h>
 #include <string.h>
@@ -39,13 +40,30 @@ void VideoMode_Init(void)
     s_mode_count = 0;
     s_current_index = 0;
 
-    // Rasters to calibrate (index 0 is the launch mode):
-    add_mode("720p @ 60Hz",           1280, 720,  60, false, true,  D3DPRESENTFLAG_PROGRESSIVE | D3DPRESENTFLAG_WIDESCREEN, 0);
-    add_mode("1080i @ 60Hz",          1920, 1080, 60, true,  true,  D3DPRESENTFLAG_INTERLACED  | D3DPRESENTFLAG_WIDESCREEN, 0);
-    // 720x480: ITU-R BT.601 D1 width
-    add_mode("480p (720x480) @ 60Hz", 720,  480,  60, false, true,  D3DPRESENTFLAG_PROGRESSIVE | D3DPRESENTFLAG_WIDESCREEN, 0);
-    add_mode("480p (640x480) @ 60Hz", 640,  480,  60, false, false, D3DPRESENTFLAG_PROGRESSIVE, 0);
-    add_mode("480i (640x480) @ 60Hz", 640,  480,  60, true,  false, D3DPRESENTFLAG_INTERLACED,  0);
+    // Only the modes the dashboard settings allow, best first; the app opens in the first one
+    // the console accepts. SD is 720x480 (CEA VIC 2/3 progressive, 6/7 interlaced), never
+    // 640x480, with the widescreen flag as the dashboard has it; a PAL console without PAL-60
+    // gets 576i instead of 480i.
+    const DWORD vf = XGetVideoFlags();
+    const DWORD sdWide = (vf & XC_VIDEO_FLAGS_WIDESCREEN) ? D3DPRESENTFLAG_WIDESCREEN : 0;
+    // HD modes (480p/720p/1080i) only on NTSC: a PAL-I console keeps the dashboard's HD flags
+    // but still outputs 576i, and a 720p back buffer then showed only its top-left corner.
+    const DWORD std = XGetVideoStandard();
+    const bool hd_ok = std == XC_VIDEO_STANDARD_NTSC_M || std == XC_VIDEO_STANDARD_NTSC_J;
+    if (hd_ok && (vf & XC_VIDEO_FLAGS_HDTV_720p)) {
+        add_mode("720p @ 60Hz", 1280, 720, 60, false, true, D3DPRESENTFLAG_PROGRESSIVE | D3DPRESENTFLAG_WIDESCREEN, 0);
+    }
+    if (hd_ok && (vf & XC_VIDEO_FLAGS_HDTV_1080i)) {
+        add_mode("1080i @ 60Hz", 1920, 1080, 60, true, true, D3DPRESENTFLAG_INTERLACED | D3DPRESENTFLAG_WIDESCREEN, 0);
+    }
+    if (hd_ok && (vf & XC_VIDEO_FLAGS_HDTV_480p)) {
+        add_mode("480p (720x480) @ 60Hz", 720, 480, 60, false, sdWide != 0, D3DPRESENTFLAG_PROGRESSIVE | sdWide, 0);
+    }
+    if (std == XC_VIDEO_STANDARD_PAL_I && !(vf & XC_VIDEO_FLAGS_PAL_60Hz)) {
+        add_mode("576i (720x576) @ 50Hz", 720, 576, 50, true, sdWide != 0, D3DPRESENTFLAG_INTERLACED | sdWide, 0);
+    } else {
+        add_mode("480i (720x480) @ 60Hz", 720, 480, 60, true, sdWide != 0, D3DPRESENTFLAG_INTERLACED | sdWide, 0);
+    }
 
     s_initialized = true;
 }
@@ -71,33 +89,4 @@ void VideoMode_SetCurrentIndex(int index)
     if (index >= 0 && index < s_mode_count) {
         s_current_index = index;
     }
-}
-
-int VideoMode_GetNextIndex(int currentIndex)
-{
-    if (s_mode_count <= 0) return 0;
-    return (currentIndex + 1) % s_mode_count;
-}
-
-int VideoMode_GetPrevIndex(int currentIndex)
-{
-    if (s_mode_count <= 0) return 0;
-    return (currentIndex - 1 + s_mode_count) % s_mode_count;
-}
-
-int VideoMode_FindMatch(uint16_t width, uint16_t height, bool interlaced)
-{
-    // Try exact match first (width, height, interlace)
-    for (int i = 0; i < s_mode_count; i++) {
-        if (s_modes[i].width == width && s_modes[i].height == height && s_modes[i].interlaced == interlaced) {
-            return i;
-        }
-    }
-    // Fallback to height and interlace
-    for (int i = 0; i < s_mode_count; i++) {
-        if (s_modes[i].height == height && s_modes[i].interlaced == interlaced) {
-            return i;
-        }
-    }
-    return -1;
 }

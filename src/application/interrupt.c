@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "stm32f0xx_hal.h"
 #include "../shared/adv7511.h"
 #include "../shared/debug.h"
@@ -9,7 +10,8 @@ void SysTick_Handler(void) {
 }
 
 void HardFault_Handler(void) {
-    debug_log("HardFault occurred!\r\n");
+    debug_log("HardFault occurred!\n");
+    debug_tx_drain();   // UART output goes out by DMA; nothing else will push it now
     while (1);
 }
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "bl_uart_update.h"
 
 #include "stm32.h"
@@ -108,7 +109,7 @@ static void bl_uart_transfer_body(void)
 
     uint8_t hdr[10]; // ver:u8 | flags:u8 | img_size:u32 | img_crc32:u32
     if (!uart_read_exact(hdr, sizeof(hdr), 2000)) {
-        debug_log("XHDE 2\r\n");   // hello timeout
+        debug_log("XHDE 2\n");   // hello timeout
         return;
     }
 
@@ -119,9 +120,9 @@ static void bl_uart_transfer_body(void)
     bool     keep_p63 = (flags & BL_FLAG_KEEP_P63) != 0;
 
     if (ver != BL_UART_PROTO_VER || img_size == 0 || img_size > BL_UART_MAX_IMG) {
-        debug_log("[BL UART] reject ver=%u size=%lu max=%lu\r\n",
+        debug_log("[BL UART] reject ver=%u size=%lu max=%lu\n",
                   ver, (unsigned long)img_size, (unsigned long)BL_UART_MAX_IMG);
-        debug_log("XHDE 1\r\n");
+        debug_log("XHDE 1\n");
         return;
     }
 
@@ -134,7 +135,7 @@ static void bl_uart_transfer_body(void)
     // the rest of page 63 (user_config) is untouched until the image checks out.
     flash_set_flag();
 
-    debug_log("XHDK %u %lu\r\n", (unsigned)BL_UART_PAGE_SIZE, (unsigned long)n_pages);
+    debug_log("XHDK %u %lu\n", (unsigned)BL_UART_PAGE_SIZE, (unsigned long)n_pages);
     uart_drain();
     uint32_t retry_budget = n_pages * 6 + 16;
 
@@ -144,7 +145,7 @@ static void bl_uart_transfer_body(void)
             !uart_read_exact(seqb, 2, 3000) ||
             !uart_read_exact(page_buf, BL_UART_PAGE_SIZE, 3000) ||
             !uart_read_exact(crcb, 4, 3000)) {
-            debug_log("XHDE 3\r\n");   // frame recv timeout
+            debug_log("XHDE 3\n");   // frame recv timeout
             return;
         }
 
@@ -154,7 +155,7 @@ static void bl_uart_transfer_body(void)
         // Host missed an earlier ACK and resent a page we already wrote: re-ACK
         // it (without re-flashing) and don't advance -- resyncs the two counters.
         if (seq < i) {
-            debug_log("XHDK %u\r\n", seq);
+            debug_log("XHDK %u\n", seq);
             uart_drain();
             continue;
         }
@@ -165,12 +166,12 @@ static void bl_uart_transfer_body(void)
                   (crc32_buf(page_buf, BL_UART_PAGE_SIZE) == pcrc) &&
                   flash_program_page_verified(page, page_buf, BL_UART_PAGE_SIZE, pcrc);
 
-        debug_log("XHD%c %u\r\n", ok ? 'K' : 'N', seq);
+        debug_log("XHD%c %u\n", ok ? 'K' : 'N', seq);
         uart_drain();
 
         if (!ok) {
             if (retry_budget-- == 0) {
-                debug_log("XHDE 4\r\n");   // retry budget exhausted
+                debug_log("XHDE 4\n");   // retry budget exhausted
                 return;
             }
             continue;   // host resends the same seq
@@ -181,7 +182,7 @@ static void bl_uart_transfer_body(void)
 
     uint32_t actual = crc32_flash(APP_START_ADDRESS, img_size);
     bool good = (actual == img_crc);
-    debug_log("XHDD %u %08lX\r\n", good ? 0u : 1u, (unsigned long)actual);
+    debug_log("XHDD %u %08lX\n", good ? 0u : 1u, (unsigned long)actual);
 
     if (good) {
         // Clear the app-invalid flag. --keep-config keeps the rest of page 63 (user_config:
@@ -192,12 +193,12 @@ static void bl_uart_transfer_body(void)
         } else {
             flash_erase_page(LAST_FLASH_PAGE);
         }
-        debug_log("[BL UART] DONE OK (%s) -- resetting into app\r\n",
+        debug_log("[BL UART] DONE OK (%s) -- resetting into app\n",
                   keep_p63 ? "config kept" : "page 63 wiped");
         HAL_Delay(50);
         NVIC_SystemReset();
     } else {
-        debug_log("[BL UART] DONE FAIL want=%08lX got=%08lX -- staying in bootloader\r\n",
+        debug_log("[BL UART] DONE FAIL want=%08lX got=%08lX -- staying in bootloader\n",
                   (unsigned long)img_crc, (unsigned long)actual);
     }
 }

@@ -128,9 +128,26 @@ def build_and_combine(target, source, env):
     with open(application_bin, 'rb') as f:
         application_data = f.read()
     
+    # Stamp the image header (src/shared/app_header.h): magic, length, then the CRC-32 of
+    # the image with the crc field left out. The linker leaves it all ones right after the
+    # vector table; anything else there means the layout moved, and the check would fail.
+    import struct
+    import zlib
+    HDR_OFF, HDR_MAGIC = 0xC0, 0x31485841
+    app = bytearray(application_data)
+    app += bytes([PADDING_VALUE] * (-len(app) % 4))
+    if app[HDR_OFF:HDR_OFF + 12] != b"\xff" * 12:
+        print(f"✗ Error: no blank image header at 0x{HDR_OFF:X} (found {app[HDR_OFF:HDR_OFF + 12].hex()})")
+        sys.exit(1)
+    struct.pack_into("<II", app, HDR_OFF, HDR_MAGIC, len(app))
+    crc = zlib.crc32(bytes(app[:HDR_OFF + 8]) + bytes(app[HDR_OFF + 12:])) & 0xFFFFFFFF
+    struct.pack_into("<I", app, HDR_OFF + 8, crc)
+    application_data = bytes(app)
+    print(f"Image header: {len(app)} bytes, CRC-32 {crc:08X}")
+
     application_size = len(application_data)
     print(f"Application size: {application_size} bytes")
-    
+
     if application_size > APP_SIZE_BYTES:
         print(f"✗ Error: Application size ({application_size} bytes) exceeds app region size ({APP_SIZE_BYTES} bytes)!")
         sys.exit(1)
@@ -146,29 +163,11 @@ def build_and_combine(target, source, env):
     with open(output_bin, 'wb') as f:
         f.write(combined_data)
 
-    # Archive into bin/ keyed by git hash (same value debug.c's version banner
-    # reports, via inject_git_version.py) and update bin/firmware.bin. Naming by
-    # hash instead of wall-clock time ties every archived binary directly to the
-    # commit that produced it -- rebuilding the same commit overwrites the same
-    # file instead of piling up an indistinguishable duplicate, and a binary
-    # pulled off the board via the `version` UART command maps straight back to
-    # a specific point in git history.
+    # bin/firmware.bin is the one tracked image: the latest build, nothing else is kept.
+    # (Its version banner carries the commit, so a binary read back from the board maps to git.)
     bin_dir = Path(project_dir) / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        git_hash = subprocess.check_output(
-            ["git", "rev-parse", "--short=8", "HEAD"], cwd=project_dir, stderr=subprocess.DEVNULL
-        ).decode().strip()
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=project_dir, stderr=subprocess.DEVNULL
-        ).decode().strip()
-        if dirty:
-            git_hash += "-dirty"
-    except Exception:
-        git_hash = "unknown"
-    hashed_bin = bin_dir / f"firmware_{git_hash}.bin"
     latest_bin = bin_dir / "firmware.bin"
-    shutil.copy2(output_bin, hashed_bin)
     shutil.copy2(output_bin, latest_bin)
 
     # Drop-in folder for XHDUpdater.xbe: it loads firmware_<encoder>.bin from its own
@@ -187,7 +186,7 @@ def build_and_combine(target, source, env):
     total_size = len(combined_data)
     print(f"\n✓ Combined binary created successfully!")
     print(f"  Output: {output_bin}")
-    print(f"  Archived to: {hashed_bin}")
+    print(f"  Image: {latest_bin}")
     print(f"  XHDUpdater folder: {upd_dir}")
     print(f"  Total size: {total_size} bytes ({total_size / 1024:.2f} KB)")
     print("=" * 60)

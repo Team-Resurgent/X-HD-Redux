@@ -56,7 +56,10 @@ ENTRY(Reset_Handler)
 MEMORY
 {
 RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 8K
-FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 20K
+FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 20K - 512
+/* The mode tables the application reads too (src/shared/xbox_timing_rows.h,
+   XBOX_TIMING_TABLES_ADDR): a fixed place, whatever the code before it does. */
+TIMING (r)      : ORIGIN = 0x8004E00, LENGTH = 512
 FIRMWARE (rx)	  : ORIGIN = 0x08005000, LENGTH = 64K - 20K
 }
 
@@ -76,6 +79,11 @@ SECTIONS
     KEEP(*(.isr_vector)) /* Startup code */
     . = ALIGN(4);
   } >FLASH
+
+  .timing_tables :
+  {
+    KEEP(*(.timing_tables))
+  } >TIMING
 
   /* The program code and other data goes into FLASH */
   .text :

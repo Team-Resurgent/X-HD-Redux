@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef VIDEO_MODE_MGR_H
 #define VIDEO_MODE_MGR_H
 
@@ -9,10 +10,10 @@
 #define MAX_VIDEO_MODES 8
 
 typedef struct {
-    char     name[32];          // e.g. "480p (640x480 progressive)"
-    uint16_t width;             // Raster width (640, 720, 1280, 1920)
-    uint16_t height;            // Raster height (480, 720, 1080)
-    uint16_t refresh_rate;      // Refresh rate in Hz (60)
+    char     name[32];          // e.g. "480p (720x480) @ 60Hz"
+    uint16_t width;             // Raster width (720, 1280, 1920)
+    uint16_t height;            // Raster height (480, 576, 720, 1080)
+    uint16_t refresh_rate;      // Refresh rate in Hz (60, 50 for 576i)
     bool     interlaced;        // true = interlaced ('i'), false = progressive ('p')
     bool     widescreen;        // true = 16:9, false = 4:3
     DWORD    d3d_flags;         // D3DPRESENTFLAG_*
@@ -24,8 +25,5 @@ int  VideoMode_GetCount(void);
 const video_mode_info_t* VideoMode_Get(int index);
 int  VideoMode_GetCurrentIndex(void);
 void VideoMode_SetCurrentIndex(int index);
-int  VideoMode_GetNextIndex(int currentIndex);
-int  VideoMode_GetPrevIndex(int currentIndex);
-int  VideoMode_FindMatch(uint16_t width, uint16_t height, bool interlaced);
 
 #endif // VIDEO_MODE_MGR_H

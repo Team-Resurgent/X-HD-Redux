@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __SMBUS_I2C_H__
 #define __SMBUS_I2C_H__
 
@@ -13,7 +14,7 @@
 typedef struct
 {
     uint8_t encoder;
-    uint8_t region;
+    uint8_t region;      // unused: always 0x01 in practice, PAL and NTSC alike (doc/SMBUS.md)
     uint32_t mode;
     uint32_t titleid;
     uint32_t avinfo;
@@ -25,18 +26,17 @@ typedef struct
 // doc/SMBUS.md section 8. NOT packed on purpose: every field is naturally aligned
 // at these offsets, so the MCU's stores stay single-instruction/atomic and the
 // slave ISR (reading byte-by-byte) can never see a torn multi-byte value. The
-// _Static_asserts below pin the layout the doc and xhd_tool.py both assume.
+// _Static_asserts below pin the layout doc/SMBUS.md and the host tools assume.
 #define XHD_TELEMETRY_VERSION 1
 
 // hw_flags bits
 #define XHD_TLM_HPD            0x01
 #define XHD_TLM_MSEN           0x02
-#define XHD_TLM_TMDS_ON        0x04  // reserved in v1 (always 0)
 #define XHD_TLM_VIDEO_UNGATED  0x08
 #define XHD_TLM_AUDIO_ON       0x10
 #define XHD_TLM_FREEZE         0x20
-#define XHD_TLM_PROBE_ARMED    0x40  // reserved in v1 (always 0)
 #define XHD_TLM_PLL_LOCK       0x80
+// Bits 0x04 and 0x40 are reserved and always 0 (doc/SMBUS.md section 8).
 
 typedef struct
 {
@@ -164,23 +164,20 @@ bool consume_color_space_reapply_pending(void);
 bool smbus_consume_spd_apply_pending(void);
 
 // Control suite (opcode 13 read, 141-145 write). The slave ISR only stashes into user config +
-// raises a dirty bit; smbus_consume_settings_changes() (called from bios_loop, main-loop
-// context) does every register write / flash save / mode reapply off-ISR.
+// raises a dirty bit; smbus_consume_settings_changes() (called from video_supervisor_step,
+// main-loop context) does every register write / flash save / mode reapply off-ISR.
 
 void smbus_consume_settings_changes(const xbox_encoder xb_encoder);
 // Drains a pending WRITE_RAM_APPLY flash write off-ISR -- see that command's own comment
 // in smbus_i2c.c. Call once per main-loop iteration, alongside the above.
 void smbus_consume_flash_write(void);
 
-void smbus_set_sniff(bool enable);
-bool smbus_get_sniff(void);
-
 bool smbus_get_apply_frozen(void);
+uint8_t smbus_frozen_packet_count(void);   // packets the freeze ignored, wrapping
 // UART bridge (debug.c `sb`): run one SMBus read/write command from the main loop.
 // False for an opcode the bridge doesn't carry (mode-packet staging/apply, updater RAM/flash).
 bool smbus_bridge_read(uint8_t cmd, uint8_t *out);
 bool smbus_bridge_write(uint8_t cmd, uint8_t value);
-void smbus_poll_sniffer(void);
 
 
 #endif // __SMBUS_I2C_H__

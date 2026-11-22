@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __ADV7511_VIC_H__
 #define __ADV7511_VIC_H__
 
@@ -82,6 +83,12 @@ static inline bool vic_is_576p(uint8_t v) {
 }
 static inline bool vic_is_576i(uint8_t v) {
     return v == VIC_21_576i_50_2xClk_4_3 || v == VIC_22_576i_50_2xClk_16_9;
+}
+// A VIC's raster: the 4:3 VIC of a 4:3/16:9 pair (3, 18, 22 -> 2, 17, 21), any other VIC as it
+// is. Unlike a family, 640x576 (21/22) and 720x576 (17/18) stay apart.
+static inline uint8_t vic_pair_base(uint8_t v) {
+    return (v == VIC_03_480p_60_16_9 || v == VIC_18_576p_50_16_9 || v == VIC_22_576i_50_2xClk_16_9)
+         ? (uint8_t)(v - 1) : v;
 }
 
 #endif // __ADV7511_VIC_H__

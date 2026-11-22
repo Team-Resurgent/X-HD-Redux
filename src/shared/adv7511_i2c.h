@@ -1,6 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __ADV7511_I2C_H__
 #define __ADV7511_I2C_H__
 
+#include <stdbool.h>
+#include <stdint.h>
 #include "stm32.h"
 
 void adv7511_i2c_init();
@@ -9,5 +12,7 @@ void adv7511_i2c_init();
 // both images.
 void i2c_init_or_hang(I2C_HandleTypeDef *h, const char *name);
 I2C_HandleTypeDef* adv7511_i2c_instance();
+
+#include "i2c1.h"
 
 #endif // __ADV7511_I2C_H__

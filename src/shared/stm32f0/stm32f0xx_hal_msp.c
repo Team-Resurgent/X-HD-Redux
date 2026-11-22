@@ -37,6 +37,7 @@
   ******************************************************************************
   */
 
+#include "gpio.h"
 #include "stm32f0xx_hal.h"
 
 void HAL_MspInit(void)
@@ -53,15 +54,11 @@ void HAL_MspInit(void)
 void HAL_I2C_MspInit(I2C_HandleTypeDef *hi2c)
 {
 
-    GPIO_InitTypeDef GPIO_InitStruct;
     if (hi2c->Instance == I2C1)
     {
-        GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1;
-        GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
-        GPIO_InitStruct.Pull = GPIO_PULLUP;
-        GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-        GPIO_InitStruct.Alternate = GPIO_AF1_I2C1;
-        HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+        // PF0/PF1 -- the bus actually runs on PB6/PB7 (adv7511_i2c_init()); kept as it was,
+        // flagged in doc/FIRMWARE_SIMPLIFY_REVIEW.md (possible bug 1).
+        gpio_init(GPIOF, GPIO_PIN_0 | GPIO_PIN_1, GPIO_MODE_AF_OD, GPIO_PULLUP, GPIO_SPEED_FREQ_HIGH, GPIO_AF1_I2C1);
         __HAL_RCC_I2C1_CLK_ENABLE();
     }
 }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __VIDEO_SUPERVISOR_H__
 #define __VIDEO_SUPERVISOR_H__
 

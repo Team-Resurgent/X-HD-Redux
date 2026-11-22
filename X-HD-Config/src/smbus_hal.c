@@ -1,53 +1,53 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include <string.h>
 #include "smbus_hal.h"
+
+_Static_assert(sizeof(XHD_PICTURE) == 14, "one picture profile is 14 bytes");
+_Static_assert(sizeof(XHD_PICTURE_SET) == 43, "READ_PICTURE is 43 bytes");
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #endif
 
+bool smbus_read_at(uint8_t addr, uint8_t cmd, uint8_t *val)
+{
+    if (!val) {
+        return false;
+    }
+    DWORD v = 0;
+    if (!NT_SUCCESS(HalReadSMBusValue(addr, cmd, FALSE, &v))) {
+        return false;
+    }
+    *val = (uint8_t)(v & 0xFF);
+    return true;
+}
+
+bool smbus_write_at(uint8_t addr, uint8_t cmd, uint8_t val)
+{
+    return NT_SUCCESS(HalWriteSMBusValue(addr, cmd, FALSE, (DWORD)val));
+}
+
 bool smbus_read_byte(uint8_t opcode, uint8_t *outVal)
 {
-    if (!outVal) {
-        return false;
-    }
-    DWORD val = 0;
-    NTSTATUS st = HalReadSMBusValue(XHD_SMBUS_ADDR, opcode, FALSE, &val);
-    if (!NT_SUCCESS(st)) {
-        return false;
-    }
-    *outVal = (uint8_t)(val & 0xFF);
-    return true;
+    return smbus_read_at(XHD_SMBUS_ADDR, opcode, outVal);
 }
 
 bool smbus_write_byte(uint8_t opcode, uint8_t val)
 {
-    NTSTATUS st = HalWriteSMBusValue(XHD_SMBUS_ADDR, opcode, FALSE, (DWORD)val);
-    return NT_SUCCESS(st);
+    return smbus_write_at(XHD_SMBUS_ADDR, opcode, val);
 }
 
-bool smbus_detect_board(uint8_t *outMode, uint8_t ver[4])
+// fw_detect() only reads; the rest of fw_io_t is never called from it.
+static void detect_sleep(uint32_t ms) { Sleep(ms); }
+static uint32_t detect_ticks(void) { return GetTickCount(); }
+static void detect_progress(uint32_t done, uint32_t total) { (void)done; (void)total; }
+static void detect_log(const char *msg) { (void)msg; }
+
+bool smbus_detect(fw_board_t *out)
 {
-    uint8_t mode = 0;
-    if (!smbus_read_byte(XHD_OP_READ_MODE, &mode)) {
-        return false;
-    }
-
-    if (outMode) {
-        *outMode = mode;
-    }
-
-    if (ver) {
-        smbus_read_byte(XHD_OP_READ_VERSION1, &ver[0]);
-        smbus_read_byte(XHD_OP_READ_VERSION2, &ver[1]);
-        smbus_read_byte(XHD_OP_READ_VERSION3, &ver[2]);
-        smbus_read_byte(XHD_OP_READ_VERSION4, &ver[3]);
-        // 0xFF 0xFF 0xFF 0xFF means not an X-HD board
-        if (ver[0] == 0xFF && ver[1] == 0xFF && ver[2] == 0xFF && ver[3] == 0xFF) {
-            return false;
-        }
-    }
-
-    return true;
+    static const fw_io_t kIo = { smbus_read_at, smbus_write_at, detect_sleep, detect_ticks,
+                                 detect_progress, detect_log };
+    return fw_detect(&kIo, out);
 }
 
 bool smbus_read_video_info(XHD_VIDEO_INFO *outInfo)
@@ -204,9 +204,77 @@ bool smbus_write_spd(const char spd[24])
     return smbus_write_byte(XHD_OP_WRITE_SPD_APPLY, 1);
 }
 
+static bool picture_valid(const XHD_PICTURE *p)
+{
+    if (p->white_clip < XHD_PIC_WHITE_MIN || p->black_clip > XHD_PIC_BLACK_MAX ||
+        p->contrast < XHD_PIC_CONTRAST_MIN || p->contrast > XHD_PIC_CONTRAST_MAX ||
+        p->brightness < -XHD_PIC_BRIGHT_MAX || p->brightness > XHD_PIC_BRIGHT_MAX ||
+        p->chroma_cos < 0 || p->chroma_cos > 2 * XHD_PIC_Q12_ONE ||
+        p->chroma_sin < -2 * XHD_PIC_Q12_ONE || p->chroma_sin > 2 * XHD_PIC_Q12_ONE) {
+        return false;
+    }
+    for (int r = 0; r < 3; r++) {
+        if (p->gain[r] < XHD_PIC_GAIN_MIN || p->gain[r] > XHD_PIC_GAIN_MAX ||
+            p->bias[r] < -XHD_PIC_BIAS_MAX || p->bias[r] > XHD_PIC_BIAS_MAX) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Byte 0 is the live profile (0-2). v1 firmware sent its 8-byte block there (white clip
+// first, 128-255), so it fails here like firmware without picture controls.
+bool smbus_read_picture(XHD_PICTURE_SET *out)
+{
+    if (!out) return false;
+    // APPLY 0 resets both cursors without applying anything.
+    if (!smbus_write_byte(XHD_OP_WRITE_PICTURE_APPLY, 0)) return false;
+    uint8_t *b = (uint8_t *)out;
+    for (size_t i = 0; i < sizeof(*out); i++) {
+        if (!smbus_read_byte(XHD_OP_READ_PICTURE, &b[i])) return false;
+    }
+    if (out->live >= XHD_PIC_PROFILES) return false;
+    for (int i = 0; i < XHD_PIC_PROFILES; i++) {
+        if (!picture_valid(&out->prof[i])) return false;
+    }
+    return true;
+}
+
+bool smbus_read_picture_live(uint8_t *live)
+{
+    uint8_t b;
+    if (!live || !smbus_write_byte(XHD_OP_WRITE_PICTURE_APPLY, 0) ||
+        !smbus_read_byte(XHD_OP_READ_PICTURE, &b) || b >= XHD_PIC_PROFILES) {
+        return false;
+    }
+    *live = b;
+    return true;
+}
+
+bool smbus_write_picture(uint8_t profile, const XHD_PICTURE *pic, XHD_PICTURE_SET *now)
+{
+    if (!pic || profile >= XHD_PIC_PROFILES || !picture_valid(pic)) return false;
+    if (!smbus_write_byte(XHD_OP_WRITE_PICTURE_APPLY, 0)) return false;
+    if (!smbus_write_byte(XHD_OP_WRITE_PICTURE_DATA, profile)) return false;
+    const uint8_t *b = (const uint8_t *)pic;
+    for (size_t i = 0; i < sizeof(*pic); i++) {
+        if (!smbus_write_byte(XHD_OP_WRITE_PICTURE_DATA, b[i])) return false;
+    }
+    if (!smbus_write_byte(XHD_OP_WRITE_PICTURE_APPLY, 1)) return false;
+    // The board rejects a partial or out-of-range block silently: check what it holds.
+    XHD_PICTURE_SET back;
+    if (!smbus_read_picture(&back)) return false;
+    if (now) *now = back;
+    return memcmp(&back.prof[profile], pic, sizeof(*pic)) == 0;
+}
+
+// Read back: firmware older than a value (6, YCbCr through the CSC) ignores it and keeps its
+// setting, which READ_COLOR_SPACE then still shows.
 bool smbus_set_color_space(uint8_t cs)
 {
-    return smbus_write_byte(XHD_OP_WRITE_COLOR_SPACE, cs);
+    uint8_t back;
+    return smbus_write_byte(XHD_OP_WRITE_COLOR_SPACE, cs) &&
+           smbus_read_byte(XHD_OP_READ_COLOR_SPACE, &back) && back == cs;
 }
 
 bool smbus_set_aspect_ratio(uint8_t ar)
@@ -249,9 +317,15 @@ bool smbus_set_cec_one_touch(bool enable)
     return smbus_write_byte(XHD_OP_WRITE_CEC_ONE_TOUCH, enable ? 1 : 0);
 }
 
-bool smbus_set_cec_standby(bool enable)
+bool smbus_set_cec_standby(uint8_t mode)
 {
-    return smbus_write_byte(XHD_OP_WRITE_CEC_STANDBY, enable ? 1 : 0);
+    // Wire values: 1 = restore (the pre-mode "on"), 0 = nothing, 2 = always standby.
+    return smbus_write_byte(XHD_OP_WRITE_CEC_STANDBY, mode == 0 ? 1 : (mode == 1 ? 0 : 2));
+}
+
+bool smbus_set_sd_exact(bool exact)
+{
+    return smbus_write_byte(XHD_OP_WRITE_SD_EXACT, exact ? 1 : 0);
 }
 
 bool smbus_set_audio_mute(bool mute)
@@ -321,17 +395,18 @@ bool smbus_poll_cec_frame(uint8_t outFrame[16], uint8_t *outLen)
         return false;
     }
 
-    for (uint8_t i = 0; i < len; i++) {
-        uint8_t b = 0;
-        if (smbus_read_byte(XHD_OP_READ_CEC_RX_DATA, &b)) {
-            outFrame[i] = b;
-        } else {
-            outFrame[i] = 0;
-        }
+    // A byte lost to a bus error drops the whole frame: a key with a wrong opcode or operand
+    // would be acted on as if the TV had sent it.
+    bool ok = true;
+    for (uint8_t i = 0; i < len && ok; i++) {
+        ok = smbus_read_byte(XHD_OP_READ_CEC_RX_DATA, &outFrame[i]);
     }
 
-    // Acknowledge and release the hardware buffer
+    // Acknowledge and release the hardware buffer either way
     smbus_write_byte(XHD_OP_WRITE_CEC_RX_ACK, 1);
+    if (!ok) {
+        return false;
+    }
     *outLen = len;
     return true;
 }

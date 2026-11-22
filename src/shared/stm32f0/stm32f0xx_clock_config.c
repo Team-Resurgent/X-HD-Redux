@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "stm32f0xx_hal.h"
 #include "stm32f0xx.h"
 #include "../error_handler.h"
@@ -7,8 +8,8 @@ void SystemClock_Config(void)
     // MCU runs HSI/2 -> PLL x6 = 24 MHz rather than raw HSI (8 MHz): the passive SMBus
     // probe's ISR needs the headroom against a real I2C bit's ~5 us budget. On the F030x8
     // the PLL input is fixed at HSI/2 (4 MHz), so x6 is 24 MHz, not the 48 MHz this was
-    // written for (measured: TIM1 /4 gave 6 MHz). SystemCoreClockUpdate() computes the real
-    // value, so HAL-derived rates (UART BRR, SysTick) are right; the I2C2 TIMINGR and the
+    // written for (measured: TIM1 /4 gave 6 MHz). SystemCoreClock is set to that (below), so
+    // the rates derived from it (UART BRR, SysTick) are right; the I2C2 TIMINGR and the
     // busy-wait counts were sized for 48 MHz and run 2x slow (each site says so).
     // debug_init() must run before this function (see main()'s comment): if this hits
     // _Error_Handler() (which itself calls debug_log()), a failure here before debug_init()
@@ -83,18 +84,20 @@ void SystemClock_Config(void)
         Error_Handler();
     }
 
-    SystemCoreClockUpdate();
+    // The clock the steps above set: HSI/2 x6. Not SystemCoreClockUpdate(), which reads it
+    // back through RCC and pulls in the AHB/APB prescaler tables for the same answer.
+    SystemCoreClock = (HSI_VALUE / 2u) * 6u;
 
     // 8. I2C1 (ADV7511) deliberately stays on raw HSI (8MHz), independent of the PLL/HCLK
     // switch above -- same RCC_I2C1CLKSOURCE_HSI the HAL struct's I2c1ClockSelection field
     // set.
     MODIFY_REG(RCC->CFGR3, RCC_CFGR3_I2C1SW, RCC_I2C1CLKSOURCE_HSI);
 
-    // Configure the Systick interrupt time
-    HAL_SYSTICK_Config(HAL_RCC_GetHCLKFreq() / 1000);
-
-    // Configure the Systick
-    HAL_SYSTICK_CLKSourceConfig(SYSTICK_CLKSOURCE_HCLK);
+    // SysTick at 1 kHz from HCLK (= SYSCLK, AHB DIV1), as HAL_SYSTICK_Config() and
+    // HAL_SYSTICK_CLKSourceConfig(HCLK) set it; its priority is set below.
+    SysTick->LOAD = SystemCoreClock / 1000u - 1u;
+    SysTick->VAL = 0;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_TICKINT_Msk | SysTick_CTRL_ENABLE_Msk;
 
     // SysTick_IRQn priority -- deliberately below (numerically higher than) the shared
     // EXTI4_15 vector (ADV7511 + passive SMBus bus probes, priority 2). EXTI->PR is a

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+#include "gpio.h"
 #include "smbus_slave_common.h"
 #include "adv7511_i2c.h"
 #include "defines.h"
@@ -18,13 +20,7 @@ void smbus_slave_init(void)
     __HAL_RCC_I2C2_CLK_ENABLE();
 
     // I2C2 pins: PB10=SCL, PB11=SDA
-    GPIO_InitTypeDef gpio = {0};
-    gpio.Pin = GPIO_PIN_10 | GPIO_PIN_11;
-    gpio.Mode = GPIO_MODE_AF_OD;
-    gpio.Pull = GPIO_PULLUP;
-    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
-    gpio.Alternate = GPIO_AF1_I2C2;
-    HAL_GPIO_Init(GPIOB, &gpio);
+    gpio_init(GPIOB, GPIO_PIN_10 | GPIO_PIN_11, GPIO_MODE_AF_OD, GPIO_PULLUP, GPIO_SPEED_FREQ_HIGH, GPIO_AF1_I2C2);
 
     h->Instance = I2C2;
     // PCLK1 is 24 MHz (HSI/2 x 6, stm32f0xx_clock_config.c). PRESC = 5 divides it by 6:
@@ -62,7 +58,9 @@ void smbus_set_mode_and_reset(uint8_t mode)
     // Not HAL_Delay(10) -- this runs inside the I2C2 ISR (priority 1), which SysTick
     // (priority 3) can't preempt, so the tick would never advance. A busy-wait lets the
     // write's ACK finish before the reset: 120000 iterations were sized for ~10 ms at 48 MHz;
-    // at the real 24 MHz it is ~20 ms.
+    // at the real 24 MHz it is ~20 ms. The application's debug output goes out by DMA (see
+    // debug.c's uart_putc()); the chunk in flight finishes during this wait, but nothing
+    // drains the rest here -- waiting for it would hold the console's SMBus ISR longer.
     for (volatile uint32_t i = 0; i < 120000; i++) { __NOP(); }
     NVIC_SystemReset();
 }

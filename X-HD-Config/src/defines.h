@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
 #ifndef __XGMATH_INL__
@@ -9,6 +10,10 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+
+// This app's version, shown on Tab 5 and in Help; released together with the firmware
+// (I2C_HDMI_VERSION2-4 in src/shared/defines.h).
+#define APP_VERSION "2.0.2"
 
 // X-HD SMBus 7-bit slave address: 0x69 (8-bit write 0xD2, read 0xD3)
 #define XHD_SMBUS_ADDR                  0xD2
@@ -39,6 +44,8 @@
 #define XHD_OP_READ_ABOUT               23
 #define XHD_OP_READ_LIVE_FLAGS          24
 #define XHD_OP_READ_USER_CONFIG         25
+#define XHD_OP_READ_FLASH_STATUS        26
+#define XHD_OP_READ_PICTURE             27
 
 // --- Write Opcodes (128 - 255) ---
 #define XHD_OP_WRITE_CONFIG             128
@@ -75,6 +82,9 @@
 #define XHD_OP_WRITE_USER_CONFIG_INDEX  160
 #define XHD_OP_WRITE_TELEMETRY_INDEX    161
 #define XHD_OP_WRITE_CEC_STANDBY        162
+#define XHD_OP_WRITE_PICTURE_DATA       163
+#define XHD_OP_WRITE_PICTURE_APPLY      164
+#define XHD_OP_WRITE_SD_EXACT           165 // 0=Fill (640 window), 1=Exact (CEA 480p/576p where on a CEA raster)
 
 // --- Action codes for WRITE_CONFIG_ACTION (142) ---
 #define XHD_ACTION_SAVE_FLASH           1
@@ -86,6 +96,13 @@
 #define XHD_MODE_BOOTLOADER             1
 #define XHD_MODE_APPLICATION            2
 
+// --- READ_FLASH_STATUS (26) values: the last WRITE_RAM_APPLY. Firmware older than the
+// opcode answers 0x42 (application) or 0xFF (bootloader) ---
+#define XHD_FLASH_IDLE                  0
+#define XHD_FLASH_BUSY                  1
+#define XHD_FLASH_OK                    2
+#define XHD_FLASH_FAILED                3
+
 // --- Settings Enums ---
 typedef enum {
     XHD_COLOR_SPACE_AUTO                = 0,
@@ -93,7 +110,9 @@ typedef enum {
     XHD_COLOR_SPACE_RGB_LIMITED         = 2,
     XHD_COLOR_SPACE_YCBCR_PASSTHROUGH   = 3,
     XHD_COLOR_SPACE_RGB_PASSTHROUGH     = 4,
-    XHD_COLOR_SPACE_AUTO_SD_FULL        = 5
+    XHD_COLOR_SPACE_AUTO_SD_FULL        = 5,
+    XHD_COLOR_SPACE_YCBCR_CSC           = 6   // YCbCr 4:4:4 through the CSC: the picture controls
+                                              // apply (RGB Full on a sink without YCbCr 4:4:4)
 } xhd_color_space_e;
 
 typedef enum {
@@ -230,8 +249,9 @@ typedef struct {
     uint8_t        cec_clock_off;     // 228 : 0=On (12MHz generated), 1=Off
     uint8_t        cec_one_touch_off; // 229 : 0=On (wake & switch), 1=Off
     uint8_t        smbus_freeze;      // 230 : 0=Normal, 1=Freeze mode
-    uint8_t        cec_standby_off;   // 231 : 0=On (standby at shutdown), 1=Off
-    uint8_t        reserved[2];       // 232
+    uint8_t        cec_standby_off;   // 231 : at shutdown 0=Restore the TV (default), 1=Off, 2=Always standby
+    uint8_t        sd_exact;          // 232 : 0=Fill (640 window), 1=Exact (CEA mode)
+    uint8_t        reserved[1];       // 233
     uint32_t       checksum;          // 234 : Checksum over bytes 0..233
 } xhd_user_config;
 
@@ -241,6 +261,48 @@ typedef struct {
     uint32_t  checksum;
 } xhd_spd_config;
 
+// --- Picture settings (READ_PICTURE = 27 / WRITE_PICTURE_DATA = 163 + APPLY = 164) ---
+// The firmware's proc-amp (doc/SMBUS.md, READ_PICTURE): folded
+// into the CSC table and the output clip, so only the CSC colour spaces use them; the
+// passthroughs send the encoder's levels untouched. One 14-byte profile per signal kind.
+typedef struct {
+    uint8_t   white_clip;         // 0 : brightest output code, 128-255 (default 250)
+    uint8_t   black_clip;         // 1 : darkest output code, 0-64
+    uint8_t   contrast;           // 2 : Y gain in percent, 50-150
+    int8_t    brightness;         // 3 : output codes added, -64..64
+    int16_t   chroma_cos;         // 4 : Q12 saturation x cos(hue); 4096 = 100 %, 0-8192
+    int16_t   chroma_sin;         // 6 : Q12 saturation x sin(hue); + turns red toward yellow
+    uint8_t   gain[3];            // 8 : output rows A, B, C (R, G, B in RGB) in percent, 50-150
+    int8_t    bias[3];            // 11: output codes added to rows A, B, C, -32..32
+} XHD_PICTURE;                    // 14 bytes
+
+// The whole READ_PICTURE answer (43 bytes): which profile the board uses now, then all three.
+// A write stages one profile: its index, then its 14 bytes (15 bytes).
+#define XHD_PIC_PROFILE_SD      0   // SD raster on the CEA clock (27.000 / 27.027 MHz)
+#define XHD_PIC_PROFILE_HD      1   // 720p, 1080i
+#define XHD_PIC_PROFILE_OTHER   2   // SD raster on any other clock
+#define XHD_PIC_PROFILES        3
+typedef struct {
+    uint8_t     live;             // 0 : the profile in use now (0-2)
+    XHD_PICTURE prof[XHD_PIC_PROFILES];  // 1, 15, 29
+} XHD_PICTURE_SET;                // 43 bytes
+
 #pragma pack(pop)
 
 #define XHD_CONFIG_MAGIC                0x58484434 // "XHD4"
+
+// XHD_PICTURE limits (the firmware rejects a block with any field outside them) and defaults.
+#define XHD_PIC_WHITE_MIN       128
+#define XHD_PIC_WHITE_MAX       255
+#define XHD_PIC_WHITE_DEFAULT   250
+#define XHD_PIC_BLACK_MAX       64
+#define XHD_PIC_CONTRAST_MIN    50
+#define XHD_PIC_CONTRAST_MAX    150
+#define XHD_PIC_BRIGHT_MAX      64          // and -64
+#define XHD_PIC_SAT_MAX         200         // percent; |(chroma_cos, chroma_sin)| = percent * 4096 / 100
+#define XHD_PIC_Q12_ONE         4096
+#define XHD_PIC_HUE_MAX         30          // degrees, and -30 (the app's range; the board takes any angle)
+#define XHD_PIC_GAIN_MIN        50
+#define XHD_PIC_GAIN_MAX        150
+#define XHD_PIC_GAIN_DEFAULT    100
+#define XHD_PIC_BIAS_MAX        32          // and -32; default 0

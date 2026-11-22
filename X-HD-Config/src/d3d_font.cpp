@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "d3d_font.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -187,26 +188,10 @@ void D3DFont_Shutdown(void)
     g_bInitialized     = false;
 }
 
-void D3DFont_SetScale(float scaleX, float scaleY)
+void D3DFont_SetOutputScale(float scaleX, float scaleY)
 {
     g_fScaleX = (scaleX > 0.05f) ? scaleX : 0.05f;
     g_fScaleY = (scaleY > 0.05f) ? scaleY : 0.05f;
-}
-
-void D3DFont_GetScale(float *scaleX, float *scaleY)
-{
-    if (scaleX) *scaleX = g_fScaleX;
-    if (scaleY) *scaleY = g_fScaleY;
-}
-
-float D3DFont_GetFontHeight(void)
-{
-    return g_fFontHeight * g_fScaleY;
-}
-
-float D3DFont_GetLineAdvance(void)
-{
-    return g_fFontYAdvance * g_fScaleY;
 }
 
 bool D3DFont_GetTextExtent(const WCHAR *str, int len, float *pWidth, float *pHeight)
@@ -237,8 +222,8 @@ bool D3DFont_GetTextExtent(const WCHAR *str, int len, float *pWidth, float *pHei
     }
     if (sx > maxW) maxW = sx;
 
-    if (pWidth)  *pWidth  = maxW * g_fScaleX;
-    if (pHeight) *pHeight = sy * g_fScaleY;
+    if (pWidth)  *pWidth  = maxW;
+    if (pHeight) *pHeight = sy;
     return true;
 }
 
@@ -247,6 +232,16 @@ float D3DFont_GetTextWidth(const WCHAR *str, int len)
     float w = 0.0f;
     D3DFont_GetTextExtent(str, len, &w, NULL);
     return w;
+}
+
+float D3DFont_GetGlyphAdvance(WCHAR ch)
+{
+    if (!g_bInitialized) return 0.0f;
+    const GLYPH_ATTR *pGlyph = &g_pGlyphs[0];
+    if (ch <= g_cMaxGlyph && g_pTranslatorTable[ch] > 0 && (DWORD)g_pTranslatorTable[ch] < g_dwNumGlyphs) {
+        pGlyph = &g_pGlyphs[g_pTranslatorTable[ch]];
+    }
+    return (float)(pGlyph->wOffset + pGlyph->wAdvance);
 }
 
 // Batch size must be <= 18 quads (72 vertices). DrawVerticesUP in Xbox D3D chunks
@@ -263,7 +258,9 @@ void D3DFont_InvalidateState(void)
     s_fontStatesConfigured = false;
 }
 
-void D3DFont_DrawText(float x, float y, DWORD color, const WCHAR *str, int len)
+// Shared glyph-quad emitter. cellW <= 0 lays out proportionally (each glyph's own
+// offset/advance); cellW > 0 centers every glyph in a fixed cellW-wide cell.
+static void draw_text_cells(float x, float y, DWORD color, const WCHAR *str, int len, float cellW)
 {
     if (!str || !g_bInitialized || len == 0) return;
 
@@ -304,9 +301,10 @@ void D3DFont_DrawText(float x, float y, DWORD color, const WCHAR *str, int len)
         s_fontStatesConfigured = true;
     }
 
-    // DirectX screen-space half-pixel offset (-0.5f) for pixel-perfect texel alignment
-    float curX = floorf(x) - 0.5f;
-    float curY = floorf(y - g_fFontTopPadding * g_fScaleY) - 0.5f;
+    // Laid out in 1280x720 terms, scaled to the back buffer as the vertices are written, with
+    // DirectX's half-pixel offset (-0.5f) for texel alignment.
+    float curX = floorf(x);
+    float curY = floorf(y - g_fFontTopPadding);
     float originX = curX;
 
     static D3D_FONT_VERTEX batch[FONT_BATCH_SIZE * 4];
@@ -317,7 +315,7 @@ void D3DFont_DrawText(float x, float y, DWORD color, const WCHAR *str, int len)
         WCHAR letter = str[i++];
         if (letter == L'\n') {
             curX = originX;
-            curY += g_fFontYAdvance * g_fScaleY;
+            curY += g_fFontYAdvance;
             continue;
         }
 
@@ -326,17 +324,19 @@ void D3DFont_DrawText(float x, float y, DWORD color, const WCHAR *str, int len)
             pGlyph = &g_pGlyphs[g_pTranslatorTable[letter]];
         }
 
-        float fOffset  = g_fScaleX * (float)pGlyph->wOffset;
-        float fAdvance = g_fScaleX * (float)pGlyph->wAdvance;
-        float fWidth   = g_fScaleX * (float)pGlyph->wWidth;
-        float fHeight  = g_fScaleY * g_fFontHeight;
-
-        curX += fOffset;
-        float left   = curX;
-        float right  = left + fWidth;
-        float top    = curY;
-        float bottom = top + fHeight;
-        curX += fAdvance;
+        float glyphX;
+        if (cellW > 0.0f) {
+            glyphX = curX + 0.5f * (cellW - (float)pGlyph->wWidth);
+            curX += cellW;
+        } else {
+            curX += (float)pGlyph->wOffset;
+            glyphX = curX;
+            curX += (float)pGlyph->wAdvance;
+        }
+        float left   = glyphX * g_fScaleX - 0.5f;
+        float right  = (glyphX + (float)pGlyph->wWidth) * g_fScaleX - 0.5f;
+        float top    = curY * g_fScaleY - 0.5f;
+        float bottom = (curY + g_fFontHeight) * g_fScaleY - 0.5f;
 
         int baseIdx = quadCount * 4;
         batch[baseIdx + 0].x   = left;
@@ -381,4 +381,14 @@ void D3DFont_DrawText(float x, float y, DWORD color, const WCHAR *str, int len)
     if (quadCount > 0) {
         D3DDevice_DrawVerticesUP(D3DPT_QUADLIST, quadCount * 4, batch, sizeof(D3D_FONT_VERTEX));
     }
+}
+
+void D3DFont_DrawText(float x, float y, DWORD color, const WCHAR *str, int len)
+{
+    draw_text_cells(x, y, color, str, len, 0.0f);
+}
+
+void D3DFont_DrawTextMono(float x, float y, DWORD color, const WCHAR *str, int len, float cellW)
+{
+    draw_text_cells(x, y, color, str, len, cellW);
 }

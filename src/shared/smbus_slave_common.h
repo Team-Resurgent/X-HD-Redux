@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 // The Xbox-facing SMBus slave, shared by the application and the bootloader: the I2C2 hardware
 // and the transaction framing (a command byte, then either a response byte the master reads or

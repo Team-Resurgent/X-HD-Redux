@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __VIC_ARBITER_H__
 #define __VIC_ARBITER_H__
 
@@ -9,16 +10,16 @@
 // ladder: levels are checked top-down and the first that owns the decision returns.
 //
 // Called from stand_alone_loop(). Pure -- no HAL, I2C or statics -- so the host tests
-// (hosttests/run_arbiter_fixtures.c, run_fixtures.c) drive it directly.
+// drive it directly.
 
 #include <stdint.h>
 #include <stdbool.h>
 
 typedef enum {
     ARB_SRC_HOLD = 0,      // no change -- current output already satisfies the decision
-    ARB_SRC_BIOS,          // a BIOS SMBus mode (confirmed or fast-confirmed pending)
-    ARB_SRC_BIOS_WAIT,     // a BIOS target is pending but not yet confirmable -> hold, bounded
-    ARB_SRC_PATH_A,        // a stable SD signal in the Path A pixel-clock window (see
+    ARB_SRC_BIOS,          // the confirmed BIOS SMBus mode
+                           // (2 was BIOS_WAIT; the numbers are SMBus telemetry, READ 22 byte 5)
+    ARB_SRC_PATH_A = 3,    // a stable SD signal in the Path A pixel-clock window (see
                            // ARB_PATH_A_PCLK_LOW_HZ/HIGH_HZ below)
     ARB_SRC_HW_VIC,        // the ADV7511 line detector resolved to a usable, incompatible VIC
     ARB_SRC_WIDTH,         // SD narrow/wide correction from the width signal (encoder registers, else the clock)
@@ -42,14 +43,20 @@ typedef struct {
     // stale in the SDTV clock band and the last verdict was kept). Must not override a fresh
     // BIOS packet.
     bool     width_stale_held;
+    // The width describes a mode set from before the console's latest packet (Xcalibur: the
+    // mode index wasn't re-derived since -- a byte the sniffer missed kept 0x07 under a 0x08
+    // packet). It can't make that packet's BIOS mode stale.
+    bool     width_predates_bios;
+    // Focus is on its SDTV encoder path (VID_CNTL0 INT_PROG, focus_sd_is_sdtv_family()): at
+    // its 27.000 MHz 576 clock only the 576-line modes 0x05/0x06/0x12 use it, its 480p modes
+    // the progressive path.
+    bool     focus_sdtv;
     bool     tmds_cycle_busy;   // an apply cycle's async tail is in flight -> can't apply now
 
     // --- BIOS / SMBus ---
     bool     bios_confirmed;        // adv7511_active_mode_is_bios() -- last apply was BIOS
-    bool     bios_pending;          // a reconcile target is pending
-    uint8_t  pending_mode_index;    // from the live SMBus settings (0xFF = none)
     uint8_t  confirmed_mode_index;  // last *applied* BIOS mode_index (0xFF = none)
-    bool     bios_widescreen;       // the active/pending mode dword's WIDESCREEN bit (bit 28)
+    bool     bios_widescreen;       // the BIOS mode dword's WIDESCREEN bit (bit 28)
 
     // --- context ---
     arb_aspect_t user_aspect;   // user_config aspect override
@@ -82,11 +89,9 @@ typedef struct {
     // are register-identical to 0x02/0x04/0x08 and read as those. Filled by the caller; this
     // file stays pure.
     uint8_t  xcal_mode_index;
-    // The encoder's sniffed width register and its write epoch (bumped on every write, so
-    // every mode set -- aspect-only ones too): Conexant H_ACTIVE (0x78), Focus IHO (0x00,
-    // sharing IHW's epoch). 0/0 on Xcalibur.
-    uint16_t width_reg;
-    uint8_t  width_reg_epoch;
+    // The HD mode the encoder's own registers say it was last set to (smbus_probe.c's
+    // xbox_encoder_hd_vic()): VIC 4, 5, or 0 = not known. Only meaningful on an HD clock.
+    uint8_t  enc_hd_vic;
 } arb_snapshot_t;
 
 typedef struct {
@@ -94,24 +99,12 @@ typedef struct {
     uint32_t hw_incompat_since;   // hw_vic has read incompatible-with-active for this long
     uint32_t width_mismatch_since;
     uint32_t path_a_since;
-    uint32_t bios_pending_since;
     uint32_t blind_since;
     uint32_t bios_stale_since;    // confirmed BIOS mode has disagreed with the live hw VIC
-                                  // family this long, no packet pending -> hand back to L4
+                                  // family this long -> hand back to L4
     bool     path_a_latched;      // Path A applied its VIC (2 or 3) and holds until the signal leaves
     uint8_t  pal50_sd_cand;      // last arb_pal50_sd_vic() reading (debounce candidate)
     uint32_t pal50_sd_since;     // when pal50_sd_cand was first seen -- must hold before trusted
-    bool     hd_ever_seen;        // a 720p/1080i VIC (hw, active, or a BIOS HD mode) has been
-                                  // seen at least once this boot. NOT proof of NTSC: a PAL
-                                  // console with HD enabled outputs 720p/1080i too. arb_region()
-                                  // uses it only when neither EEPROM nor pal_ever_seen answers.
-    bool     pal_ever_seen;       // a BIOS PAL mode_index, a live 576-family hw_vic, or
-                                  // (Conexant) a pclk in its 576p50 band -- the live readings on
-                                  // a stable SD-range clock -- has been seen at least once this
-                                  // boot. An NTSC console never produces a 576-line raster, so
-                                  // this outranks hd_ever_seen. Lets arb_region() commit to PAL50
-                                  // without EEPROM VideoStandard, which a board-only reset (no
-                                  // console reboot) never re-captures; EEPROM still wins.
     // hw_stale (decide_target_vic()): the clock when hw_vic's raw byte last changed, and how
     // long the live clock has stayed far from it.
     uint8_t  hw_vic_locked;
@@ -126,16 +119,6 @@ typedef struct {
     // releasing the hold. The escape only fires when the PAL50 verdict never resolves, so
     // each firing is a bug to find -- stand_alone_loop() logs its rising edge.
     bool     hold_stuck_escaped;
-    // Early-aspect skip (see decide_target_vic()): the raster signal at the arbiter's last
-    // apply, when the early signal (a new Xcalibur index / Conexant or Focus WSS change) last
-    // arrived, and the width register's epoch at that WSS change.
-    uint8_t  xcal_idx_at_apply;
-    uint8_t  xcal_idx_last;
-    uint16_t width_reg_at_apply;
-    bool     wss_seen;
-    bool     wss_last;
-    uint8_t  width_epoch_at_wss;
-    uint32_t early_aspect_since;
     // L6 blind-fallback latch, like path_a_latched: the fallback verdict is recomputed from
     // the clock every call, and our own TMDS cycle zeroes the clock mid-apply, which without a
     // latch flipped the verdict every iteration (VIC 1/2/3 bouncing while blind). Frozen while
@@ -145,10 +128,20 @@ typedef struct {
     uint8_t  blind_fb_vic;        // the committed verdict
     bool     blind_fb_ws;
     bool     blind_fb_ana;
+    uint8_t  blind_fb_aspect;     // the user_aspect it was committed under
     uint8_t  blind_fb_cand_vic;   // in-progress candidate awaiting ARB_BLIND_FALLBACK_HOLD_MS
     bool     blind_fb_cand_ws;
     bool     blind_fb_cand_ana;
     uint32_t blind_fb_cand_since;
+    // A verdict under way this pass, each level flagging its own wait: L3's Path A hold, L4's
+    // settle gate holding for the clock or a detector disagreement debouncing, L5's width
+    // hold, L6 holding the mode for an unresolved PAL50 verdict. The standalone loop's
+    // s_settled reads it.
+    bool     verdict_pending;
+    // The last HD VIC the detector read (trusted), and the encoder's HD register then: a
+    // register that hasn't changed since the detector contradicted it is stale (see L6).
+    uint8_t  hd_det_vic;
+    uint8_t  hd_det_enc;
 } arb_state_t;
 
 typedef struct {
@@ -163,13 +156,6 @@ typedef struct {
 #define ARB_HW_DEBOUNCE_MS        30
 #define ARB_WIDTH_HOLD_MS         200
 #define ARB_PATH_A_HOLD_MS        600
-#define ARB_BIOS_WAIT_MS          2000
-// Early-aspect skip bound: above the longest early-signal -> real-apply gap logged (~0.8s),
-// so a misread raster signal can delay an aspect change by at most this, never block it.
-#define ARB_EARLY_ASPECT_MAX_MS   1000
-// Conexant mode-set burst: WSS (0x60-0x64) is written ~10ms before H_ACTIVE (0x78); wait at
-// most this for the burst's H_ACTIVE write before treating a WSS change as aspect-only.
-#define ARB_CX_BURST_WAIT_MS      50
 #define ARB_BLIND_TIMEOUT_MS      60
 #define ARB_BIOS_STALE_MS         250   // how long the live hw VIC must contradict a
                                         // confirmed BIOS mode before standalone reclaims
@@ -178,7 +164,8 @@ typedef struct {
                                         // drive a mode switch -- anti-flap near a split point
 #define ARB_HOLD_STUCK_TIMEOUT_MS 1500  // L6's hold_480/hold_576 give up waiting on an
                                         // unresolved PAL50 verdict after this -- well past the
-                                        // ~650 ms normal settle (400 ms pclk_stable + 250 ms
+                                        // ~550 ms normal settle from the first clock reading
+                                        // (300 ms PCLK_STABLE_WINDOW_MS + 250 ms
                                         // ARB_PAL50_SD_HOLD_MS)
 #define ARB_BLIND_FALLBACK_HOLD_MS 300 // L6's blind-fallback verdict must hold this long
                                         // (frozen samples excluded) before it's trusted --
@@ -232,7 +219,7 @@ static inline bool arb_cx_clock_is_640x576_par(uint32_t p) {
 #define ARB_HD_PCLK_MIN_HZ        40000000UL
 
 // Any SD raster's clock: a blind detector reading with a stable clock in this range is
-// plausibly an SD mode (a pending BIOS mode's check, the supervisor's relock settle).
+// plausibly an SD mode (the supervisor's relock settle).
 #define ARB_SD_PCLK_MIN_HZ        12000000UL
 #define ARB_SD_PCLK_MAX_HZ        30000000UL
 
@@ -241,6 +228,6 @@ vic_decision_t decide_target_vic(const arb_snapshot_t *in, arb_state_t *st);
 // signal in a different SD family (640 / 720x480 / 576) than active_vic -- a mode change in
 // progress, not a clock shift within the active VIC. stand_alone_loop()'s drift re-applies
 // use it so they don't re-push the old VIC.
-bool arb_clock_contradicts_active_family(const arb_snapshot_t *in, const arb_state_t *st);
+bool arb_clock_contradicts_active_family(const arb_snapshot_t *in);
 
 #endif // __VIC_ARBITER_H__

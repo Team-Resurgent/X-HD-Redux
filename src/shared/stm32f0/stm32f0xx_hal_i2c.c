@@ -320,7 +320,7 @@
   */
 
 /* Includes ------------------------------------------------------------------*/
-/* X-HD LOCAL COPY (Entry #399) of framework-stm32cubef0's stm32f0xx_hal_i2c.c -- the
+/* X-HD Redux LOCAL COPY of framework-stm32cubef0's stm32f0xx_hal_i2c.c -- the
  * package copy is excluded from the build by scripts/hal_overrides.py so this one is used
  * instead. Every change is behind XHD_HAL_I2C_NO_DMA; with it set to 0 this file is the
  * vendor file unchanged. Why: this firmware never attaches a DMA handle to I2C1/I2C2, yet
@@ -7375,7 +7375,7 @@ static void I2C_Enable_IRQ(I2C_HandleTypeDef *hi2c, uint16_t InterruptRequest)
   uint32_t tmpisr = 0U;
 
 #if XHD_HAL_I2C_NO_DMA
-  /* X-HD: XferISR is never a DMA handler here (no I2C DMA anywhere), so always the
+  /* X-HD Redux: XferISR is never a DMA handler here (no I2C DMA anywhere), so always the
    * interrupt-mode branch -- dropping these comparisons is what unlinks the DMA ISRs. */
   if (1)
 #else

@@ -80,6 +80,9 @@ SECTIONS
   {
     . = ALIGN(4);
     KEEP(*(.isr_vector)) /* Startup code */
+    /* The image header (src/shared/app_header.c), at APP_HEADER_OFFSET: the bootloader finds
+       it there. scripts/combine_firmware.py checks the offset before stamping it. */
+    KEEP(*(.app_header))
     . = ALIGN(4);
   } >FLASH
 

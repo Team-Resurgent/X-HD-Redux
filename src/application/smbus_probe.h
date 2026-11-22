@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __SMBUS_PROBE_H__
 #define __SMBUS_PROBE_H__
 
@@ -64,6 +65,9 @@ bool xbox_encoder_get_int_prog(const xbox_encoder enc, bool *out);
 // "genuinely rewritten" vs "value happens to match" distinction as xbox_focus_get_ihw_epoch()
 // above. 0 for Xcalibur, or for an encoder that hasn't had a write yet this boot.
 uint8_t xbox_encoder_get_int_prog_epoch(const xbox_encoder enc);
+// The HD mode the encoder was last set to: VIC 4 (720p), 5 (1080i), 0 = not known. Only
+// meaningful on an HD clock (see smbus_probe.c).
+uint8_t xbox_encoder_hd_vic(const xbox_encoder enc);
 // Passively-sniffed live WSS aspect broadcast to TVs -- Focus's WSS_DATAF1 (reg 0x83) or
 // Conexant's WSSDAT (reg 0x60, region-dependent bit encoding -- see CX_REG_WSS_DATA_B0's own
 // comment in smbus_probe.c), unlike the EEPROM Widescreen bit which is captured once at boot.
@@ -84,6 +88,12 @@ uint8_t xbox_cx_get_hactive_epoch(void);
 // The Xcalibur's mode index, derived from its own raster registers (any BIOS); 0 = none yet.
 // Register-identical pairs read as the 720-wide one: 0x0F -> 0x02, 0x10 -> 0x04, 0x11 -> 0x08.
 uint8_t xbox_xcal_mode_index(void);
+// True when that index was derived before the console's latest mode packet (smbus_i2c.c's
+// update sequence): it describes the previous mode set. Call after xbox_xcal_mode_index().
+bool xbox_xcal_mode_index_predates_packet(void);
+// The same for Focus's IHO/IHW and Conexant's H_ACTIVE: the latest width write came before the
+// console's latest mode packet (never written: the boot's). False for Xcalibur.
+bool xbox_encoder_width_predates_packet(xbox_encoder enc);
 // Caller buffer size smbus_enc_trace() requires/fills per call (each of addr/reg/val).
 #define ENC_TRACE_PAGE 64
 // Bring-up trace: encoder-register writes (all 3 encoder addresses), oldest first, starting
@@ -101,6 +111,9 @@ uint16_t smbus_enc_trace_lost(void);
 #define SMC_EV_AUDIO_CLAMP 0x01
 #define SMC_EV_SHUTDOWN    0x02
 uint8_t smbus_smc_events_take(void);
+// Tick of the latest encoder register write (the SMC's aren't counted): a console mode set's
+// burst is a run of them.
+uint32_t smbus_encoder_write_at(void);
 // Decode traced encoder writes (main loop only). The getters above call it themselves.
 void smbus_probe_drain(void);
 // Manual override -- inject an encoder address so smbus_check_probed_encoder() self-latches

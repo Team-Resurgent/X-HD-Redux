@@ -29,7 +29,7 @@ typedef struct {
     unsigned char  internal_vic;        // 15 : internal CEA family
     unsigned char  detected_vic;        // 16 : line detector VIC
     unsigned char  console_mode_index;  // 17 : BIOS mode index
-    unsigned char  color_space;         // 18 : 1 RGB full, 2 RGB limited, 3 YCbCr, 4 RGB pass
+    unsigned char  color_space;         // 18 : 1 RGB full, 2 RGB limited, 3 YCbCr pass, 4 RGB pass, 6 YCbCr adjustable
     char           pos_h;               // 19
     char           pos_v;               // 20
     unsigned char  reserved[3];         // 21

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "xbox_mode_index.h"
 #include "types.h"
 
@@ -19,7 +20,7 @@ static const uint8_t s_mode[0x13] = {
     [0x0E] = FAM_HD_1080i,
     [0x0F] = FAM_SD_640     | MODE_640 | MODE_BIOS_AUTH,                // NTSC 640 "1.1:1 PAR"
     [0x10] = FAM_SD_640     | MODE_640 | MODE_PAL50 | MODE_BIOS_AUTH,   // PAL 640 "1.1:1 PAR"
-    [0x11] = FAM_SD_720x480 | MODE_480P,                                // 480p 720
+    [0x11] = FAM_SD_640     | MODE_640 | MODE_480P | MODE_BIOS_AUTH,    // 480p "1.1:1 PAR", 640 framed from 0x08's line
     [0x12] = FAM_SD_720x576 | MODE_640 | MODE_PAL50,                    // PAL 640x576 PAR
 };
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
 // ============================================================================
@@ -12,7 +13,13 @@
 #define LAST_FLASH_PAGE         ((FLASH_TOTAL_SIZE >> FLASH_PAGE_SHIFT) - 1)
 
 #define BOOTLOADER_MAGIC_VALUE      0xDEADBEEF
+// The `rst rec` CLI command: the bootloader's recovery screen, as with a bad image, without
+// touching flash. A RAM flag the bootloader clears as it reads it: the next reset starts the
+// application again.
+#define BOOTLOADER_RECOVERY_VALUE   0xC0DEB007
+#ifndef BOOTLOADER_FLAG_ADDRESS    // overridable only for host tests
 #define BOOTLOADER_FLAG_ADDRESS     ((volatile uint32_t*)(RAM_START_ADDRESS + 0xf0))
+#endif
 
 // Bootloader and application addresses (20KB bootloader)
 #define BOOTLOADER_SIZE           0x5000  // 20KB
@@ -26,6 +33,13 @@
 // ============================================================================
 // INTERRUPTS
 // ============================================================================
+
+// Where an ISR and the main loop hand data over through a volatile flag or index: volatile
+// orders only volatile accesses, so the plain data next to it could move across. Writer: the
+// data, ISR_BARRIER(), then the flag; reader: the flag, ISR_BARRIER(), then the data. A
+// compiler barrier is enough on the single-core M0 (no code; __DMB() costs 4 bytes). With
+// -flto it matters across files too: a call into another file no longer stands in for one.
+#define ISR_BARRIER() __asm__ volatile ("" ::: "memory")
 
 // ADV7511 INT is on PF7, routed to EXTI4_15
 #define ADV_IRQ_HANDLER EXTI4_15_IRQHandler
@@ -59,8 +73,8 @@
 #define I2C_HDMI_COMMAND_READ_ASPECT_RATIO 16 // Read active aspect ratio (0=Auto, 1=16:9, 2=4:3)
 #define I2C_HDMI_COMMAND_READ_SCAN_MODE 17 // Read active scan mode (0=Auto, 1=TV overscan, 2=PC underscan)
 // CEC relay: the console's own BIOS/homebrew CEC stack sends and reads raw frames through
-// these. X-HD's own CEC (One Touch Play, a few automatic replies, <Standby>) is in adv7511.c.
-#define I2C_HDMI_COMMAND_READ_CEC_STATUS 18 // [0]=Tx busy [1]=Tx last OK [2]=Tx last arb-lost [3]=Tx last retry-timeout [4]=Rx frame pending [5]=CEC clock output on (WRITE 156) [6]=One Touch Play on (WRITE 157) [7]=Standby at shutdown on (WRITE 162)
+// these. X-HD Redux's own CEC (One Touch Play, a few automatic replies, <Standby>) is in adv7511.c.
+#define I2C_HDMI_COMMAND_READ_CEC_STATUS 18 // [0]=Tx busy [1]=Tx last OK [2]=Tx last arb-lost [3]=Tx last retry-timeout [4]=Rx frame pending [5]=CEC clock output on (WRITE 156) [6]=One Touch Play on (WRITE 157) [7]=Shutdown restore/standby on (WRITE 162 != 0; the mode itself is in READ 25's config)
 #define I2C_HDMI_COMMAND_READ_CEC_RX_LEN 19 // Length (1-16) of the pending Rx frame, 0 if none
 #define I2C_HDMI_COMMAND_READ_CEC_RX_DATA 20 // Read one byte of the pending Rx frame at an auto-incrementing cursor (header first)
 // HDMI SPD InfoFrame name (24 bytes: [0..7] vendor, [8..23] product, printable ASCII, space-
@@ -68,13 +82,19 @@
 // value 0 resets both cursors without committing.
 #define I2C_HDMI_COMMAND_READ_SPD_DATA 21 // Read one byte of the live SPD name at an auto-incrementing cursor (wraps at 24)
 // Video info snapshot (XhdVideoInfo in application/smbus_i2c.h): what the console sends and
-// what X-HD applied -- resolution, exact refresh, wire VIC, colour space. WRITE 151 = 1 latches
+// what X-HD Redux applied -- resolution, exact refresh, wire VIC, colour space. WRITE 151 = 1 latches
 // a consistent copy and resets the cursor; READ 22 then streams it one byte per read. Poll
 // cheaply by latching and reading only the first 3 bytes (version, size, change counter).
 #define I2C_HDMI_COMMAND_READ_VIDEO_INFO 22
 #define I2C_HDMI_COMMAND_READ_ABOUT 23 // Read one byte of the about block (XhdAbout: chip ID, MCU UID, git hash, build date) at an auto-incrementing cursor
-#define I2C_HDMI_COMMAND_READ_LIVE_FLAGS 24 // [0]=audio mute held (WRITE 158) [1]=SMBus freeze on (WRITE 159)
+#define I2C_HDMI_COMMAND_READ_LIVE_FLAGS 24 // [0]=audio mute held (WRITE 158) [1]=SMBus freeze on (WRITE 159) [2]=the TV sent CEC <Standby> (cleared by WRITE 148=2)
 #define I2C_HDMI_COMMAND_READ_USER_CONFIG 25 // Read one byte of the live user config (page-63 layout, user_config.h) at an auto-incrementing cursor (wraps); WRITE 160 sets it
+#define I2C_HDMI_COMMAND_READ_FLASH_STATUS 26 // The last WRITE_RAM_APPLY: I2C_HDMI_FLASH_* below. Both images; older firmware answers 0xFF
+// Picture settings (procamp_settings, doc/SMBUS.md READ_PICTURE: white clip, black clip, contrast,
+// brightness, chroma cos/sin as little-endian int16, gain[3], bias[3] -- 14 bytes per profile,
+// profiles 0 SD, 1 HD, 2 non-standard). Staged like the SPD name: WRITE_PICTURE_DATA bytes,
+// then WRITE_PICTURE_APPLY.
+#define I2C_HDMI_COMMAND_READ_PICTURE 27 // Read one byte of the picture state at an auto-incrementing cursor (wraps at 43): the live profile index, then profiles 0, 1, 2
 // Wire-VIC mode and picture position are read through READ_VIDEO_INFO (flags 0x80, pos_h/pos_v).
 
 // Write Actions
@@ -103,7 +123,7 @@
 // CEC relay writes -- see the READ_CEC_* opcodes' own comment above.
 #define I2C_HDMI_COMMAND_WRITE_CEC_TX_DATA 146 // Stage one Tx frame byte (header first) at an auto-incrementing cursor, reset by the previous WRITE_CEC_TX_APPLY
 #define I2C_HDMI_COMMAND_WRITE_CEC_TX_APPLY 147 // value = total frame length (1-16); sends the staged bytes, then resets the staging cursor
-#define I2C_HDMI_COMMAND_WRITE_CEC_RX_ACK 148 // value=1: free the pending Rx frame (whether or not it was read) for the next one
+#define I2C_HDMI_COMMAND_WRITE_CEC_RX_ACK 148 // value=1: free the pending Rx frame (whether or not it was read) for the next one; 2: clear READ 24 bit 2 (TV standby)
 // SPD name writes -- see READ_SPD_DATA's comment above.
 #define I2C_HDMI_COMMAND_WRITE_SPD_DATA 149 // Stage one name byte at an auto-incrementing cursor (0-23)
 #define I2C_HDMI_COMMAND_WRITE_SPD_APPLY 150 // 1 = commit all 24 staged bytes (rejected unless all 24 staged + printable) and resend SPD; 0 = reset cursors only. Persist with WRITE_CONFIG_ACTION=1
@@ -118,7 +138,10 @@
 #define I2C_HDMI_COMMAND_WRITE_FREEZE 159 // 1 = ignore the console's mode packets (WRITE_CONFIG_APPLY), 0 = off (default). Persist with WRITE_CONFIG_ACTION=1 to apply at boot
 #define I2C_HDMI_COMMAND_WRITE_USER_CONFIG_INDEX 160 // Set the READ_USER_CONFIG cursor
 #define I2C_HDMI_COMMAND_WRITE_TELEMETRY_INDEX 161 // Set the READ_TELEMETRY cursor
-#define I2C_HDMI_COMMAND_WRITE_CEC_STANDBY 162 // 1 = send the TV CEC <Standby> when the console shuts down (default), 0 = off. Persist with WRITE_CONFIG_ACTION=1
+#define I2C_HDMI_COMMAND_WRITE_CEC_STANDBY 162 // At console shutdown: 1 = restore the TV as One Touch Play found it (previous source / <Standby>; default), 0 = nothing, 2 = always <Standby>. Persist with WRITE_CONFIG_ACTION=1
+#define I2C_HDMI_COMMAND_WRITE_PICTURE_DATA 163 // Stage one picture byte at an auto-incrementing cursor (0-14): the profile index, then its 14 bytes
+#define I2C_HDMI_COMMAND_WRITE_PICTURE_APPLY 164 // 1 = commit the 15 staged bytes (rejected unless all 15 staged, profile < 3 and in range) and refold live; 0 = reset cursors only. Persist with WRITE_CONFIG_ACTION=1
+#define I2C_HDMI_COMMAND_WRITE_SD_EXACT 165 // 640 SD modes: 0 = Fill (640 window, default), 1 = Exact (those on a CEA raster go out as that CEA mode); reapplies the current mode. Persist with WRITE_CONFIG_ACTION=1
 
 // Release version, read over SMBus opcodes 1-4 (XHDUpdater, `v`). VERSION1 stays 0 (the
 // original project's 0.1.8.0 already used it that way); VERSION2-4 = major.minor.patch.
@@ -126,7 +149,14 @@
 #define I2C_HDMI_VERSION1 0
 #define I2C_HDMI_VERSION2 2
 #define I2C_HDMI_VERSION3 0
-#define I2C_HDMI_VERSION4 0
+#define I2C_HDMI_VERSION4 2
+
+// READ_FLASH_STATUS values. The bootloader writes the page inside the ISR, so it never reads
+// BUSY; the application writes it from the main loop.
+#define I2C_HDMI_FLASH_IDLE 0     // no RAM_APPLY since boot
+#define I2C_HDMI_FLASH_BUSY 1     // queued, not written yet
+#define I2C_HDMI_FLASH_OK 2       // written, read back with the buffer's CRC
+#define I2C_HDMI_FLASH_FAILED 3   // page rejected, or the write did not verify
 
 #define I2C_HDMI_MODE_BOOTLOADER 1
 #define I2C_HDMI_MODE_APPLICATION 2

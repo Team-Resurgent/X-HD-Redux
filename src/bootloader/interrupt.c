@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "stm32f0xx_hal.h"
 #include "../shared/debug.h"
 #include "../shared/defines.h"
@@ -24,7 +25,7 @@ void SysTick_Handler(void)
 
 void HardFault_Handler(void)
 {
-    debug_log("HardFault occurred!\r\n");
+    debug_log("HardFault occurred!\n");
     while (1);
 }
 

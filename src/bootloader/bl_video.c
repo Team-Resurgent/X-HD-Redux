@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "bl_video.h"
 
 #include "../shared/adv7511.h" // pulls stm32.h (HAL_GetTick)
@@ -6,90 +7,114 @@
 #include "../shared/xbox_video_timing.h"
 #include "../shared/debug.h"
 
-// Fixed timing constants lifted from the XCALIBUR column of xbox_video_timing.c's
-// mode tables (rows 0x01 / 0x02 / 0x0A / 0x0D). On Conexant/Focus the picture sits a
-// little off (up to 40 px in HD) -- fine for a recovery screen, and it lets the bootloader drop the whole per-encoder
-// table module (xbox_video_timing.c) + the standalone decision machine
-// (xbox_video_standalone.c) to make room for the UART updater.
-//
-// Fields: delay_hs, delay_vs, active_w, active_h, interlaced_offset,
-//         sync_adjust_enabled, hs_placement, hs_duration, vs_placement, vs_duration, vic
-static const XboxVideoTiming BL_TIMING_SD640 =
-    { 96, 35, 640, 480, 0, true,  16, 96, 10, 2, VIC_01_VGA_640x480_4_3 };
-static const XboxVideoTiming BL_TIMING_SD720 =
-    { 96, 36, 720, 480, 0, true,  16, 62,  9, 6, VIC_02_480p_60__4_3 };
-static const XboxVideoTiming BL_TIMING_720p =
-    { 260, 25, 1280, 720, 0, false, 0, 0, 0, 0, VIC_04_720p_60_16_9 };
-static const XboxVideoTiming BL_TIMING_1080i =
-    { 187, 20, 1920, 540, 1, false, 0, 0, 0, 0, VIC_05_1080i_60_16_9 };
+extern xbox_encoder xb_encoder;   // main.c: the latched encoder from page 63, or UNKNOWN
 
-// Resolve a raw line-detector VIC (0x3E >> 2) to one of the fixed timings above.
-// Anything unrecognised -- blind (0), PAL 576 (17/18/21/22, no bootloader PAL
-// support), or transient garbage -- maps to VIC 1 SD, the safest "something on
-// screen" default (narrow/ambiguous SD signals resolve to progressive VIC 1
-// rather than an interlaced or wide VIC here).
-static const XboxVideoTiming *bl_resolve(uint8_t hw_vic, bool *widescreen, uint8_t *out_vic)
+// Each encoder's SD clocks (kHz) and the mode the recovery screen runs at each, from the
+// sweep DB (run_bl_video_fixtures.c checks every recorded mode against these). The clock is
+// what tells SD modes apart: 0x3E reads 0-3 for the same mode from one snapshot to the next.
+// Modes that share a clock get one of them (the fixture lists which and why). mode_576 is
+// the mode for a 0x3E 576 reading (17/18) at the same clock, 0 if the clock has no 576 mode.
+// An unlatched encoder (ENCODER_UNKNOWN) uses the Xcalibur list.
+typedef struct { uint16_t khz; uint8_t mode, mode_576; } BlClock;
+static const BlClock k_xcal_clocks[] = {
+    { 20800, 0x03, 0 },      // PAL 640x480 @ 50
+    { 23400, 0x10, 0 },      // PAL 480-line (0x04 too)
+    { 24545, 0x01, 0 },      // NTSC 640x480 (0x07 too)
+    { 27000, 0x08, 0x06 },   // NTSC 720x480 (0x02/0x0F/0x11); 576 (0x05/0x12 too)
+};
+static const BlClock k_cx_clocks[] = {
+    { 24420, 0x01, 0 },
+    { 24625, 0x05, 0 },
+    { 24937, 0x03, 0 },
+    { 26874, 0x0F, 0 },
+    { 27000, 0x08, 0 },      // 0x07/0x11 too
+    { 27125, 0x12, 0 },
+    { 27377, 0x02, 0 },
+    { 27562, 0x10, 0 },      // 0x04 too
+    { 27687, 0x06, 0 },
+};
+static const BlClock k_focus_clocks[] = {
+    { 22680, 0x03, 0 },      // every PAL 480-line mode
+    { 27000, 0x08, 0x06 },   // NTSC 480p; 576 (0x05/0x12 too)
+    { 29454, 0x01, 0 },      // every NTSC interlaced mode
+};
+
+// HD runs ~74.2 MHz on every encoder; no SD mode is above 30 MHz.
+#define BL_HD_PCLK_MIN_HZ 50000000UL
+
+uint8_t bl_video_pick_mode(xbox_encoder enc, uint32_t pclk_hz, uint8_t vic3e)
 {
-    switch (hw_vic) {
-        case VIC_02_480p_60__4_3:
-            *widescreen = false; *out_vic = VIC_02_480p_60__4_3; return &BL_TIMING_SD720;
-        case VIC_03_480p_60_16_9:
-        case VIC_07_480i_60_2x_Clk_16_9:
-            *widescreen = true;  *out_vic = VIC_03_480p_60_16_9; return &BL_TIMING_SD720;
-        case VIC_04_720p_60_16_9:
-            *widescreen = true;  *out_vic = VIC_04_720p_60_16_9; return &BL_TIMING_720p;
-        case VIC_05_1080i_60_16_9:
-            *widescreen = true;  *out_vic = VIC_05_1080i_60_16_9; return &BL_TIMING_1080i;
-        case VIC_01_VGA_640x480_4_3:
-        case VIC_06_480i_60_2x_Clk_4_3:
-        default:
-            *widescreen = false; *out_vic = VIC_01_VGA_640x480_4_3; return &BL_TIMING_SD640;
+    if (pclk_hz >= BL_HD_PCLK_MIN_HZ) {
+        return vic3e == VIC_05_1080i_60_16_9 ? 0x0D : 0x0A;
     }
+    const BlClock *c = k_xcal_clocks;
+    uint8_t n = sizeof k_xcal_clocks / sizeof k_xcal_clocks[0];
+    if (enc == ENCODER_CONEXANT) {
+        c = k_cx_clocks;
+        n = sizeof k_cx_clocks / sizeof k_cx_clocks[0];
+    } else if (enc == ENCODER_FOCUS) {
+        c = k_focus_clocks;
+        n = sizeof k_focus_clocks / sizeof k_focus_clocks[0];
+    }
+    // The nearest clock: the real ones sit within +/-2 kHz, and a clock no mode runs still
+    // gets the closest mode's sync.
+    const BlClock *best = c;
+    uint32_t best_err = 0xFFFFFFFFu;
+    for (; n--; c++) {
+        const uint32_t hz = c->khz * 1000UL;
+        const uint32_t err = pclk_hz > hz ? pclk_hz - hz : hz - pclk_hz;
+        if (err < best_err) {
+            best_err = err;
+            best = c;
+        }
+    }
+    const bool is_576 = vic3e == VIC_17_576p_50__4_3 || vic3e == VIC_18_576p_50_16_9;
+    return (is_576 && best->mode_576) ? best->mode_576 : best->mode;
 }
 
 void bl_video_follow(void)
 {
-    static uint8_t  applied_vic = 0xFF; // VIC currently programmed (0xFF = none yet)
-    static uint8_t  cand_vic    = 0xFF; // debounce candidate
-    static uint32_t cand_since   = 0;
+    static uint8_t  applied = 0;   // mode_index on screen (0 = none yet)
+    static uint8_t  cand    = 0;   // debounce candidate
+    static uint32_t cand_since;
 
-    uint8_t hw_vic = adv7511_read_register(0x3E) >> 2;
+    const uint8_t vic3e = adv7511_read_register(0x3E) >> 2;
+    const uint32_t pclk = adv7511_get_pixel_clock_hz();
 
-    // 30ms single stability debounce -- rides out the transient garbage 0x3E
-    // reports while the GPU settles its own mode. A still-blind (0) reading is a
-    // valid, stable candidate: it resolves to VIC 1 below.
-    if (hw_vic != cand_vic) {
-        cand_vic = hw_vic;
+    // A 0 clock is no reading: the ACR halts for ~600 ms after any signal change, our own
+    // applies included, so it keeps what is on screen. Blind from the start (no clock at
+    // all), 640x480 VIC 1 gives the TV a signal to lock on.
+    uint8_t mode;
+    if (pclk != 0) {
+        mode = bl_video_pick_mode(xb_encoder, pclk, vic3e);
+    } else if (applied == 0) {
+        mode = 0x01;
+    } else {
+        return;
+    }
+
+    // Held for BL_VIDEO_SETTLE_MS: a mode set passes through transient clocks (Conexant's
+    // ~27.5 MHz ones last up to ~150 ms -- adv7511.c's PCLK_STABLE_WINDOW_MS).
+    if (mode != cand) {
+        cand = mode;
         cand_since = HAL_GetTick();
         return;
     }
-    if ((HAL_GetTick() - cand_since) < 30) {
+    if (mode == applied || (HAL_GetTick() - cand_since) < BL_VIDEO_SETTLE_MS) {
         return;
     }
-
-    bool wide = false;
-    uint8_t target_vic = VIC_00_VIC_Unavailable;
-    const XboxVideoTiming *t = bl_resolve(hw_vic, &wide, &target_vic);
-
-    if (target_vic == applied_vic) {
-        return;
-    }
-
     // Serialise with any in-flight TMDS cycle, as stand_alone_loop() does.
     if (adv7511_tmds_cycle_busy()) {
         return;
     }
 
-    debug_log("[BL VIDEO] 0x3E VIC 0x%02X -> apply VIC 0x%02X (%ux%u %s)\r\n",
-              hw_vic, target_vic, t->active_w, t->active_h, wide ? "16:9" : "4:3");
-
-    // The tables carry one VIC per raster; the applied copy takes bl_resolve()'s, so the
-    // 16:9 case sends VIC 3, not the table's 4:3 VIC 2.
-    XboxVideoTiming applied_timing = *t;
-    applied_timing.vic = target_vic;
-
+    // SD goes out 4:3 (no EEPROM capture here, and 0x3E's VIC 2/3 flaps); HD is 16:9.
+    XboxVideoTiming t;
+    xbox_base_timing(xb_encoder, mode, false, &t);
+    debug_log("[BL VIDEO] %lu kHz, 0x3E VIC %u -> mode 0x%02X (%ux%u VIC %u)\n",
+              (unsigned long)(pclk / 1000u), vic3e, mode, t.active_w, t.active_h, t.vic);
     adv7511_tmds_cycle_begin();
-    adv7511_apply_video_timing(&applied_timing, wide, false);
+    adv7511_apply_video_timing(&t, t.vic == VIC_04_720p_60_16_9 || t.vic == VIC_05_1080i_60_16_9, false);
     adv7511_tmds_cycle_end();
-    applied_vic = target_vic;
+    applied = mode;
 }

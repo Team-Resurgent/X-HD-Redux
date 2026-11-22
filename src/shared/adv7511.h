@@ -52,6 +52,13 @@ static const uint8_t CscYuvToRgb601Limited[] = {
     0x1A, 0x6A, 0x08, 0x00, 0x1D, 0x50, 0x04, 0x23,
     0x1F, 0xFC, 0x08, 0x00, 0x0D, 0xDE, 0x19, 0x13};
 
+// Colour mode 6 (COLOR_SPACE_YCBCR_CSC): YCbCr to YCbCr, the identity at x2 (1.0 = 2048).
+// Rows Cr, Y, Cb as the input ports -- the proc-amp folds into it like the RGB tables.
+static const uint8_t CscYcbcrIdentity[] = {
+    0xA8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00};
+
 typedef struct
 {
     volatile uint8_t interrupt; // set in the EXTI ISR (interrupt.c), polled from the main loop
@@ -70,10 +77,11 @@ void adv_handle_interrupts(adv7511 *encoder);
 
 #ifdef BUILD_APPLICATION
 // CEC: a relay for the console's own BIOS/homebrew CEC stack (raw frames in and out through
-// the SMBus opcodes in smbus_i2c.c), plus the little X-HD does itself -- One Touch Play at boot
-// (it claims a playback logical address), automatic answers to <Give OSD Name>, <Give
-// Physical Address> and <Give Device Vendor ID> on that address, active-source tracking and
-// <Standby> at shutdown. Application only.
+// the SMBus opcodes in smbus_i2c.c), plus what X-HD Redux does itself: it claims a playback
+// logical address every boot (again on a new physical address), with One Touch Play when on;
+// answers the discovery requests TVs send (k_cec_answer in adv7511.c) and <Feature Abort>s
+// the rest; tracks the active source; sends <Standby> at shutdown; and flags a <Standby> from
+// the TV for the BIOS (adv7511_cec_tv_standby()). Application only.
 #define ADV7511_CEC_MAX_FRAME 16 // header + up to 15 data bytes (CEC Map's own hardware limit)
 #define ADV7511_CEC_TX_BUSY      0x01 // a send is currently in flight
 #define ADV7511_CEC_TX_OK        0x02 // last send acked (valid until the next adv7511_cec_tx())
@@ -82,18 +90,23 @@ void adv_handle_interrupts(adv7511 *encoder);
 // One-time power-up + config -- call once from adv7511_reinit_chip() alongside the other
 // "fixed registers" bring-up, so CEC survives an HPD-triggered chip reset the same way.
 void adv7511_cec_init(void);
+uint8_t adv7511_cec_read_register(const uint8_t address);
+void adv7511_cec_write_register(const uint8_t address, uint8_t value);
 // Writes `len` bytes (frame[0] is the CEC header byte) and starts the send -- main loop only
 // (I2C1). false if len is out of [1,ADV7511_CEC_MAX_FRAME] or a send is still in flight.
 // The SMBus relay uses adv7511_cec_tx_queue() instead.
 bool adv7511_cec_tx(const uint8_t *frame, uint8_t len);
-// One Touch Play, one non-blocking step per call (see adv7511.c); phys_addr from the EDID.
-void adv7511_cec_one_touch_step(uint16_t phys_addr);
-// Call once per main-loop iteration: sends what is queued, services Tx completion, and
-// buffers a newly-arrived Rx frame if none is pending (a newer frame waits in hardware). A
-// frame the relay doesn't collect within CEC_RELAY_HOLD_MS (1 s) is dropped, so a console
-// with no CEC stack can't block reception.
+// CEC address claim, and One Touch Play when one_touch, one non-blocking step per call (see
+// adv7511.c); phys_addr from the EDID (0xFFFF: none yet). Call every main-loop pass.
+void adv7511_cec_claim_step(uint16_t phys_addr, bool one_touch);
+// Call once per main-loop iteration: sends what is queued, services Tx completion, and moves
+// every received frame out of the chip (its buffers stay free) into the relay's RAM queue,
+// answering the requests it handles itself. A frame the relay doesn't collect within
+// CEC_RELAY_HOLD_MS (1 s) is dropped, so a console with no CEC stack can't block reception.
 void adv7511_cec_poll(void);
-void adv7511_cec_standby(void);
+// Console shutdown: put the TV back as One Touch Play found it (restore / <Standby>), or with
+// `always`, <Standby> outright. Skipped while inactive or when the TV started the shutdown.
+void adv7511_cec_standby(bool always);
 uint8_t adv7511_cec_tx_status(void);
 // true + *len (1..ADV7511_CEC_MAX_FRAME) while a received frame is buffered and unread.
 bool adv7511_cec_rx_pending(uint8_t *len);
@@ -101,17 +114,23 @@ bool adv7511_cec_rx_pending(uint8_t *len);
 // adv7511_cec_rx_pending()). Does not itself clear the pending frame -- the relay releases
 // it with adv7511_cec_rx_release().
 void adv7511_cec_rx_read(uint8_t *out);
-// Frees the hardware Rx buffer for the next frame, whether or not this one was read (main
-// loop; the relay's ISR-side form is adv7511_cec_rx_release()).
+// Drops the oldest queued frame, whether or not it was read (main loop; the relay's ISR-side
+// form is adv7511_cec_rx_release()).
 void adv7511_cec_rx_ack(void);
 // The SMBus relay's ISR-safe forms (the ISR must not touch I2C1): queue a send / release the
 // received frame; adv7511_cec_poll() does the register work.
 bool adv7511_cec_tx_queue(const uint8_t *frame, uint8_t len);
 void adv7511_cec_rx_release(void);
+// <Standby> came from the TV and it hasn't shown it is on since (READ_LIVE_FLAGS bit 2); the
+// clear is ISR-safe (HPD / Monitor Sense rising, WRITE_CEC_RX_ACK=2).
+bool adv7511_cec_tv_standby(void);
+void adv7511_cec_tv_standby_clear(void);
 #endif
 
 void adv7511_disable_csc();
 void adv7511_apply_csc(const uint8_t * const coefficients);
+// Releases the matrix adv7511_apply_csc() left held: it takes effect at the next Vsync.
+void adv7511_csc_release(void);
 
 // Input video/clock gating (0xD6[0]) + TMDS output power. adv7511_disable/enable_video()
 // gate the *input* clock/data path -- despite the name they are not output blanking; see

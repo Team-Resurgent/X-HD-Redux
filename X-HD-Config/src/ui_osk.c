@@ -1,27 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "ui_osk.h"
 #include "ui_terminal.h"
+#include "spd_presets.h"
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 
 #define NUM_GRID_ROWS 6
 
-typedef struct {
-    const char *vendor;
-    const char *product;
-} osk_preset_t;
-
-static const osk_preset_t kPresets[] = {
-    { "MSFT",     "Xbox" },
-    { "MSFT",     "Microsoft Xbox" },
-    { "MSFT",     "X-HD" },
-    { "MSFT",     "Retro Consoles" },
-    { "HALO",     "Combat Evolved" },
-    { "SEGA",     "Dreamcast" },
-    { "SONY",     "PlayStation" },
-    { "NINTENDO", "GameCube" }
-};
-#define NUM_PRESETS (int)(sizeof(kPresets) / sizeof(kPresets[0]))
 
 static const char kRow0[] = "1234567890-_";
 static const char kRow1U[] = "QWERTYUIOP/:";
@@ -93,16 +79,16 @@ bool OSK_IsActive(void)
 
 static void apply_preset(int index)
 {
-    if (index < 0 || index >= NUM_PRESETS) return;
-    strncpy(s_vendor, kPresets[index].vendor, sizeof(s_vendor) - 1);
+    if (index < 0 || index >= SPD_PRESET_COUNT) return;
+    strncpy(s_vendor, SpdPreset_Vendor(index), sizeof(s_vendor) - 1);
     s_vendor[sizeof(s_vendor) - 1] = '\0';
-    strncpy(s_product, kPresets[index].product, sizeof(s_product) - 1);
+    strncpy(s_product, SpdPreset_Product(index), sizeof(s_product) - 1);
     s_product[sizeof(s_product) - 1] = '\0';
 }
 
 static void cycle_preset(void)
 {
-    s_presetIndex = (s_presetIndex + 1) % NUM_PRESETS;
+    s_presetIndex = (s_presetIndex + 1) % SPD_PRESET_COUNT;
     apply_preset(s_presetIndex);
 }
 

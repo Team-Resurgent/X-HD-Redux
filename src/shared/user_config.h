@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __USER_CONFIG_H__
 #define __USER_CONFIG_H__
 
@@ -7,6 +8,7 @@
 #include "adv7511_xbox.h"
 #include "types.h"
 #include "defines.h"
+#include "procamp.h"
 
 #define XHD_CONFIG_FLASH_PAGE LAST_FLASH_PAGE
 #ifndef XHD_CONFIG_FLASH_ADDR   // overridable only so host tests can point it at a RAM page
@@ -82,17 +84,25 @@ typedef struct {
                                  // input); 1 = off
     uint8_t  smbus_freeze;      // 1 = ignore the console's SMBus mode packets (pure standalone,
                                  // a test setting); 0 = default. Live, and at boot once saved.
-    uint8_t  cec_standby_off;   // 0 = CEC <Standby> to the TV when the console shuts down
-                                 // (power button or software, not a reboot); 1 = off
-    uint8_t  reserved[2];    // Reserved
+    uint8_t  cec_standby_off;   // What CEC does when the console shuts down (power button or
+                                 // software, not a reboot): 0 = restore the TV as One Touch
+                                 // Play found it (<Set Stream Path>/<Inactive Source> if it
+                                 // was on, else <Standby>; default), 1 = nothing, 2 = always
+                                 // <Standby>. Pre-mode configs hold 0 (was plain <Standby>)
+    uint8_t  sd_exact;          // 0 = Fill (default): 640 SD modes keep a 640 window; 1 = Exact: the
+                                 // ones on a CEA raster go out as that CEA mode (720 window, CEA
+                                 // sync and VIC -- xbox_get_video_timing()). Carved out of reserved[].
+    uint8_t  reserved[1];    // Reserved
     uint32_t checksum;       // Verification checksum (must stay the LAST field --
                               // calculate_checksum() hashes sizeof - sizeof(checksum))
 } xhd_user_config;
 
-// The layout READ_USER_CONFIG streams; scripts/xhd_virtual.py decodes it at these offsets.
-_Static_assert(sizeof(xhd_user_config) == 238, "user config layout changed -- update xhd_virtual.py CFG_*");
-_Static_assert(offsetof(xhd_user_config, enc_cal) == 8, "user config layout changed -- update xhd_virtual.py CFG_*");
-_Static_assert(offsetof(xhd_user_config, wire_vic_mode) == 227, "user config layout changed -- update xhd_virtual.py CFG_*");
+// The layout READ_USER_CONFIG streams; X-HD-Config/src/defines.h and host tools read it at these
+// offsets.
+_Static_assert(sizeof(xhd_user_config) == 238, "user config layout changed -- update X-HD-Config/src/defines.h and the host tools");
+_Static_assert(offsetof(xhd_user_config, enc_cal) == 8, "user config layout changed -- update X-HD-Config/src/defines.h and the host tools");
+_Static_assert(offsetof(xhd_user_config, wire_vic_mode) == 227, "user config layout changed -- update X-HD-Config/src/defines.h and the host tools");
+_Static_assert(offsetof(xhd_user_config, sd_exact) == 232, "user config layout changed -- update X-HD-Config/src/defines.h and the host tools");
 
 // HDMI SPD InfoFrame names. A separate block stored on page 63 directly
 // after xhd_user_config, with its own checksum -- deliberately NOT new xhd_user_config
@@ -107,19 +117,37 @@ typedef struct {
     uint8_t  name[XHD_SPD_NAME_LEN];
     uint32_t checksum;           // same hash as xhd_user_config's, over name[] only
 } xhd_spd_config;
+
+// Picture settings: a third page-63 block, after the SPD block, with its own
+// checksum -- same reasons as xhd_spd_config. Missing/invalid (the v1 12-byte block too: no
+// migration) -> every profile PROCAMP_NEUTRAL.
+typedef struct {
+    procamp_settings p[PROCAMP_PROFILES];
+    uint32_t checksum;           // same hash, over p
+} xhd_picture_config;
+// The live picture state, READ_PICTURE's 43 bytes as they stand: the profile the running CSC
+// uses (adv7511_xbox.c picks it), then the three profiles.
+typedef struct {
+    uint8_t profile;
+    procamp_settings p[PROCAMP_PROFILES];
+} xhd_picture_live;
 #pragma pack(pop)
 
 // The config lives at the start of flash page 63 (1 KB); the updater's app-invalid flag
 // occupies that page's last 2 bytes (APP_INVALID_FLAG_ADDRESS in defines.h). A struct
 // grown past 1022 bytes would have user_config_save() overwrite that flag.
-_Static_assert(sizeof(xhd_user_config) + sizeof(xhd_spd_config) <= 1022,
-               "xhd_user_config + xhd_spd_config must fit page 63 without touching the app-invalid flag (last 2 bytes)");
+_Static_assert(sizeof(xhd_user_config) + sizeof(xhd_spd_config) + sizeof(xhd_picture_config) <= 1022,
+               "page 63's config blocks must fit without touching the app-invalid flag (last 2 bytes)");
 
 void user_config_init(xbox_encoder xb_encoder);
 // Live SPD names (XHD_SPD_NAME_LEN bytes, see xhd_spd_config). set() validates 7-bit
 // printable ASCII (0x20-0x7E) and rejects the whole name otherwise; persists on save().
 const uint8_t *user_config_get_spd(void);
 bool user_config_set_spd(const uint8_t *name);
+// Live picture settings (procamp.h). set() takes a profile index and that profile's 14 bytes,
+// and rejects the whole block if the index or any field is out of range; persists on save().
+xhd_picture_live *user_config_picture(void);
+bool user_config_set_picture(const uint8_t *bytes);
 bool user_config_save(void);
 bool user_config_load(void);
 void user_config_restore_defaults(xbox_encoder xb_encoder);

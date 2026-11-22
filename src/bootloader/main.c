@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "main.h"
 #include "stm32f0xx_hal.h"
 #include "stm32f0xx.h"
 #include <string.h>
 #include "../shared/adv7511_xbox.h"
+#include "../shared/app_header.h"
 #include "../shared/crc32.h"
 #include "../shared/defines.h"
 #include "../shared/debug.h"
@@ -27,7 +29,15 @@ xbox_encoder xb_encoder = ENCODER_UNKNOWN;
 
 int main(void)
 {
-    HAL_Init();
+    // HAL_Init(), written out: what it and HAL_MspInit() do that isn't a reset default
+    // (the SVC/PendSV/SysTick priorities they set are 0, as at reset). SysTick at 1 ms from
+    // the 8 MHz HSI until SystemClock_Config() sets it again. (In the app the call measured
+    // smaller, so it keeps HAL_Init().)
+    FLASH->ACR |= FLASH_ACR_PRFTBE;
+    __HAL_RCC_SYSCFG_CLK_ENABLE();
+    SysTick->LOAD = SystemCoreClock / 1000u - 1u;
+    SysTick->VAL = 0;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_TICKINT_Msk | SysTick_CTRL_ENABLE_Msk;
 
     // debug_init() called before AND after SystemClock_Config() -- see application/main.c's
     // matching comment for why: makes a SystemClock_Config() failure visible
@@ -38,7 +48,7 @@ int main(void)
     debug_init();
     init_gpio();
 
-    debug_log("Entering Bootloader...\r\n");
+    debug_log("Entering Bootloader...\n");
 
     // Flash-only read, safe this early -- see the same pattern in application/main.c.
     xbox_encoder persisted_encoder;
@@ -48,6 +58,7 @@ int main(void)
 
     uint32_t flag_value = *BOOTLOADER_FLAG_ADDRESS;
     bool magic_set = (flag_value == BOOTLOADER_MAGIC_VALUE);
+    bool recovery_test = (flag_value == BOOTLOADER_RECOVERY_VALUE);
     bool recovery = recovery_jumper_enabled();
     *BOOTLOADER_FLAG_ADDRESS = 0;
 
@@ -65,11 +76,11 @@ int main(void)
     // grounded jumper still holds the board in FW-recovery mode via the launch guard below.
     if (recovery && can_launch_application() &&
         ((const xhd_user_config *)XHD_CONFIG_FLASH_ADDR)->magic == XHD_CONFIG_MAGIC) {
-        debug_log("[RECOVERY] jumper grounded -- erasing user config (Page 63)\r\n");
+        debug_log("[RECOVERY] jumper grounded -- erasing user config (Page 63)\n");
         flash_erase_page(XHD_CONFIG_FLASH_PAGE);
     }
 
-    if (!magic_set && !recovery && can_launch_application()) {
+    if (!magic_set && !recovery && !recovery_test && can_launch_application()) {
         jump_to_application();
     }
 
@@ -108,12 +119,21 @@ bool can_launch_application(void)
         return false;
     }
 
+    // The image header (app_header.h): with one, the whole image must match its CRC -- an
+    // interrupted or damaged write stays here instead of running. An image without one (an
+    // older build, or the application ELF flashed directly) gets only the checks above.
+    uint32_t want, got;
+    if (app_image_check((const uint32_t *)APP_START_ADDRESS, APP_REGION_BYTES, app_crc_hw, &want, &got) == APP_IMAGE_BAD) {
+        debug_log("[BOOT] image CRC BAD: header %08lX, flash %08lX\n", (unsigned long)want, (unsigned long)got);
+        return false;
+    }
+
     return true;
 }
 
 void jump_to_application(void)
 {
-    debug_log("Launching Application...\r\n");
+    debug_log("Launching Application...\n");
 
     volatile uint32_t *app_vector_table = (volatile uint32_t *)APP_START_ADDRESS;
     uint32_t app_entry = app_vector_table[1];
@@ -144,7 +164,7 @@ void jump_to_application(void)
 
 void enter_bootloader_mode(void)
 {
-    debug_log("Waiting for fw recovery...\r\n");
+    debug_log("Waiting for fw recovery...\n");
 
     // ADV_IRQ_HANDLER (bootloader/interrupt.c) only runs on real ADV7511
     // interrupt activity (HPD/MSEN change) if the NVIC IRQ is enabled -- without
@@ -163,6 +183,10 @@ void enter_bootloader_mode(void)
     // image) that's still polling SMBus, and adv7511_reinit_chip() below can wait
     // indefinitely on the display's HPD/MSEN -- that must never gate the Xbox's own bus.
     smbus_i2c_init();
+    // I2C1 to the ADV7511: an MCU reset leaves it unconfigured, and every read of the chip
+    // below came back 0 -- HPD never seen, no recovery video. MCU-side only; the chip waits
+    // for HPD/MSEN as before.
+    init_adv();
 
     static uint32_t last_blink = 0;
     static bool led_state = false;
@@ -224,7 +248,7 @@ void enter_bootloader_mode(void)
 
 void enter_bootloader_mode_fw(void)
 {
-    debug_log("Waiting for update...\r\n");
+    debug_log("Waiting for update...\n");
 
     smbus_i2c_init();
 

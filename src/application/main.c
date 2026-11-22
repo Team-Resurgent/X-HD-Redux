@@ -10,6 +10,8 @@
 #include "../shared/error_handler.h"
 #include "../shared/gpio.h"
 #include "../shared/defines.h"
+#include "../shared/app_header.h"
+#include "../shared/xbox_timing_rows.h"
 #include "smbus_i2c.h"
 #include "xbox_video_bios.h"
 #include "video_supervisor.h"
@@ -57,7 +59,7 @@ void cec_clock_out_follow_config(void)
     }
 }
 
-void relocate_vector_table_to_ram(void)
+static void relocate_vector_table_to_ram(void)
 {
     __HAL_RCC_SYSCFG_CLK_ENABLE();
     for (uint32_t i = 0; i < VECTOR_TABLE_SIZE; i++) {
@@ -106,7 +108,8 @@ int main(void)
     // Interrupt priorities, the one place they are explained:
     //   1  I2C2 (the console's SMBus, smbus_slave_init()) -- the console's traffic first
     //   2  EXTI4_15: the ADV7511 INT pin (PF7) and the passive SMBus probe (PB10/PB11)
-    //   3  USART2 (debug_init()) and SysTick
+    //   3  DMA1 channel 4 (UART TX chunk done, debug.c) and SysTick. UART RX comes in by DMA
+    //      with no interrupt, so nothing above can make it drop a byte.
     // I2C2 must outrank EXTI4_15: an ADV7511 interrupt burst (HPD/PLL churn) preempting the
     // slave ISR mid-ACK left I2C2 holding SCL low for 20+ seconds (WRITE_CONFIG_BANK then
     // WRITE_CONFIG_INDEX) -- the ordering prevents it, so no stuck-SCL watchdog is needed.
@@ -130,11 +133,27 @@ int main(void)
     init_adv();
     user_config_init(xb_encoder);
 
-    // Exact wording is a host-side contract: xhd_daemon.py's AUTO_TRIGGERS keys off this
-    // substring to detect an MCU reboot -- don't change it without updating that too.
+    // Exact wording is a host-side contract: host tools look for this substring to detect an
+    // MCU reboot -- don't change it without updating them.
     // Printed unconditionally, before the chip is configured, so it's visible even with
     // no display connected.
-    debug_log("\r\nX-HD ready\r\n");
+    debug_log("\nX-HD Redux ready\n");
+    // The image check the bootloader made before launching us, logged; and the mode tables
+    // this image reads from the bootloader. Inside the ADV7511 power-up wait below, so they
+    // cost no boot time.
+    {
+        uint32_t want, got;
+        const app_check_t c = app_image_check((const uint32_t *)APP_START_ADDRESS, APP_REGION_BYTES,
+                                              app_crc_hw, &want, &got);
+        if (c == APP_IMAGE_OK) debug_log(LOG_BOOT_IMAGE_CRC_OK, (unsigned long)got);
+        else if (c == APP_IMAGE_BAD) debug_log(LOG_BOOT_IMAGE_CRC_BAD,
+                                               (unsigned long)want, (unsigned long)got);
+        else debug_log(LOG_BOOT_IMAGE_NO_CRC);
+        if (!xbox_timing_tables_init()) {
+            debug_log(LOG_BOOT_NO_MODE_TABLES,
+                      (unsigned long)*(const uint32_t *)XBOX_TIMING_TABLES_ADDR);
+        }
+    }
 
     // Consume whatever's left of the 200ms ADV7511 power-up budget -- debug_print_full_dump()
     // below is the first real ADV7511 I2C access this boot.
@@ -142,7 +161,7 @@ int main(void)
     if (adv_wait_remaining_ms > 0) {
         HAL_Delay((uint32_t)adv_wait_remaining_ms);
     }
-    debug_log("[ADV WAIT] %ldms\r\n", (long)(adv_wait_remaining_ms > 0 ? adv_wait_remaining_ms : 0));
+    debug_log(LOG_ADV_WAIT_MS, (long)(adv_wait_remaining_ms > 0 ? adv_wait_remaining_ms : 0));
 
     debug_print_full_dump();
 

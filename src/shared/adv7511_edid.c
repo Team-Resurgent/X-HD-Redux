@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "adv7511_edid.h"
 #include "adv7511.h"
 #include "adv7511_i2c.h"
@@ -53,11 +54,10 @@ static void adv7511_edid_request_reread(void)
 static bool edid_read_256(uint8_t *buf)
 {
     memset(buf, 0, 256);
-    I2C_HandleTypeDef* hi2c = adv7511_i2c_instance();
 
     // Read Block 0 (128 bytes)
-    if (HAL_I2C_Mem_Read(hi2c, 0x7E, 0x00, I2C_MEMADD_SIZE_8BIT, buf, 128, 60) != HAL_OK) {
-        debug_log("[EDID] blk0 read failed\r\n");
+    if (!i2c1_read(0x7E, 0x00, buf, 128, 60)) {
+        debug_log(LOG_EDID_BLK0_READ_FAILED);
         return false;
     }
 
@@ -67,7 +67,7 @@ static bool edid_read_256(uint8_t *buf)
         // C8 = DDC controller error [7:4] / state [3:0] (Programming Guide Tables 11/12),
         // 96 = interrupt flags (EDID Ready is bit 2) -- what the controller was doing when
         // the memory read back wrong.
-        debug_log("[EDID] blk0 bad header (C8=%02X 96=%02X)\r\n",
+        debug_log(LOG_EDID_BLK0_BAD_HEADER,
                   adv7511_read_register(0xC8), adv7511_read_register(0x96));
         return false;
     }
@@ -80,15 +80,15 @@ static bool edid_read_256(uint8_t *buf)
         checksum += buf[i];
     }
     if (checksum != 0) {
-        debug_log("[EDID] blk0 csum %02X\r\n", checksum);
+        debug_log(LOG_EDID_BLK0_CSUM, checksum);
         return false;
     }
 
     // Read Block 1 if extension exists
     uint8_t ext_count = buf[126];
     if (ext_count > 0) {
-        if (HAL_I2C_Mem_Read(hi2c, 0x7E, 128, I2C_MEMADD_SIZE_8BIT, &buf[128], 128, 60) != HAL_OK) {
-            debug_log("[EDID] ext read failed\r\n");
+        if (!i2c1_read(0x7E, 128, &buf[128], 128, 60)) {
+            debug_log(LOG_EDID_EXT_READ_FAILED);
             memset(&buf[128], 0, 128);
         } else {
             uint8_t ext_checksum = 0;
@@ -96,7 +96,7 @@ static bool edid_read_256(uint8_t *buf)
                 ext_checksum += buf[i];
             }
             if (ext_checksum != 0) {
-                debug_log("[EDID] ext csum %02X\r\n", ext_checksum);
+                debug_log(LOG_EDID_EXT_CSUM, ext_checksum);
                 memset(&buf[128], 0, 128);
             }
         }
@@ -110,6 +110,7 @@ typedef struct {
     bool is_hdmi;
     bool supports_yuv444;
     bool supports_underscan;
+    bool supports_allm;      // HDMI 2.1 Auto Low Latency Mode, from the HDMI Forum block
     uint16_t phys_addr;      // CEC physical address A.B.C.D from the HDMI VSDB, 0xFFFF = none
 } edid_cached_info_t;
 
@@ -150,13 +151,19 @@ static void edid_walk_data_blocks(const uint8_t *buf, edid_block_cb cb, void *ct
 }
 
 // The HDMI VSDB (IEEE OUI 00-0C-03): its presence makes the sink HDMI, and its next two bytes
-// are the sink-assigned CEC physical address (A.B.C.D, one nibble each).
+// are the sink-assigned CEC physical address (A.B.C.D, one nibble each). The HDMI Forum block
+// -- the HF-VSDB (OUI C4-5D-D8) or HDMI 2.1's HF-SCDB (extended tag 0x79), laid out alike
+// from the version byte on -- has ALLM in its byte 8, bit 1 (p[7] here).
 static void edid_cache_hdmi_cb(uint8_t tag, uint8_t len, const uint8_t *p, void *ctx)
 {
     edid_cached_info_t *info = (edid_cached_info_t *)ctx;
     if (tag == 3 && len >= 3 && p[0] == 0x03 && p[1] == 0x0C && p[2] == 0x00) {
         info->is_hdmi = true;
         if (len >= 5) info->phys_addr = (uint16_t)((p[3] << 8) | p[4]);
+    }
+    if (len >= 8 && ((tag == 3 && p[0] == 0xD8 && p[1] == 0x5D && p[2] == 0xC4) ||   // HF-VSDB
+                     (tag == 7 && p[0] == 0x79))) {                                   // HF-SCDB
+        info->supports_allm = p[7] & 0x02;
     }
 }
 
@@ -190,6 +197,8 @@ void edid_update_cache(void)
     }
     adv7511_edid_request_reread();
 
+    // The safe unknown-sink default (below), which a failed read keeps; a good one fills it in.
+    cached_edid = (edid_cached_info_t){ .valid = true, .phys_addr = 0xFFFF, .supports_underscan = true };
     if (!edid_read_256(s_edid_buf)) {
         // Total read failure (dead DDC wire, unpowered switch, DVI-D monitor with no DDC,
         // or an AVR/HDMI-switch that raised HPD before its own DDC EEPROM rail was ready).
@@ -199,16 +208,11 @@ void edid_update_cache(void)
         // edid_update_cache() only runs on an HPD/MSEN edge, so a sink that holds HPD
         // stable through its own slow DDC power-up would otherwise stay muted until a
         // physical replug; edid_retry_periodic() below retries independently of that edge.
-        debug_log("[EDID] read failed, DVI/RGB fallback\r\n");
+        debug_log(LOG_EDID_FALLBACK);
         // The raw copy SMBus serves (READ_EDID) says the same: no EDID. A failed check leaves
         // a partial or garbled block in the buffer, and keeping an earlier good one would
         // describe what may be a different display.
         memset(s_edid_buf, 0, sizeof s_edid_buf);
-        cached_edid.valid = true;
-        cached_edid.is_hdmi = false;
-        cached_edid.phys_addr = 0xFFFF;
-        cached_edid.supports_yuv444 = false;
-        cached_edid.supports_underscan = true;
         if (!s_edid_read_failed) {
             s_edid_fail_since = HAL_GetTick();
         }
@@ -217,9 +221,6 @@ void edid_update_cache(void)
         return;
     }
     s_edid_read_failed = false;
-    cached_edid.valid = true;
-    cached_edid.is_hdmi = false;
-    cached_edid.phys_addr = 0xFFFF;
     edid_walk_data_blocks(s_edid_buf, edid_cache_hdmi_cb, &cached_edid);
     cached_edid.supports_underscan = (s_edid_buf[128] == 0x02 && (s_edid_buf[131] & 0x80));
     // YCbCr needs HDMI: a sink without the HDMI VSDB gets DVI mode (0xAF[1]=0) and no AVI
@@ -275,9 +276,15 @@ bool edid_supports_underscan(void)
     return cached_edid.supports_underscan;
 }
 
+bool edid_supports_allm(void)
+{
+    if (!cached_edid.valid) edid_update_cache();
+    return cached_edid.supports_allm;
+}
+
 // Raw 256-byte EDID (both blocks) for a caller (e.g. a console-side dashboard, over SMBus)
 // to parse independently, rather than being limited to whatever subset of
-// fields X-HD itself decodes into cached_edid.
+// fields X-HD Redux itself decodes into cached_edid.
 //
 // Deliberately no lazy edid_update_cache() fallback here, unlike the getters above: this is
 // the one EDID accessor reachable from an I2C ISR context (HAL_I2C_SlaveRxCpltCallback in

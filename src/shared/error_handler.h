@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
 // Line number only: the one caller is stm32f0xx_clock_config.c, so __FILE__ would just add a

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 // What each console mode_index (an SMBus mode packet's bits 23:16, or the Xcalibur's raster
 // registers) is, in one table: its geometry family and the flags the arbiter, the BIOS path and

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+#include "gpio.h"
 #include "debug.h"
 #include "stm32.h"
 #include "adv7511.h"
@@ -36,16 +38,40 @@ typedef struct {
 static RingBuffer debugBuffer = {0};
 static volatile bool s_ring_dropped = false;   // debug_ring_log() had to drop a line
 static volatile uint8_t rx_buffer[RX_BUFFER_SIZE] = {0};
-static volatile uint8_t rx_head = 0;
-static volatile uint8_t rx_tail = 0;
-// Tick of the last byte the ISR accepted -- the CLI's partial-line purge measures line
-// silence from byte arrival, not from when the main loop last got around to polling.
-static volatile uint32_t rx_last_tick = 0;
 
 #ifdef BUILD_APPLICATION
+static volatile uint8_t rx_tail = 0;
 static char cli_line[CLI_CMD_MAX_LEN] = {0};
 static uint8_t cli_pos = 0;
-#endif
+
+// The application receives by DMA (channel 5 -- the F030's fixed USART2_RX request, no
+// remap): each byte lands in rx_buffer the moment it arrives, whatever the CPU is doing. An
+// interrupt copying byte by byte at priority 3 could be held off past one character time
+// (~87 us) by the passive SMBus probe's edge interrupts (priority 2, armed for the board's
+// whole runtime) -- the console's own bus traffic, e.g. its ~115 s temperature poll -- and
+// the next byte then overwrote the unread one: "ERR: crc", or a command lost outright when
+// that byte was its newline. Priorities stay as they are (see main.c).
+//
+// A byte received with a framing/noise error (PA3 picks up noise, e.g. during the console's
+// power-up) raises no DMA request with CR3.DDRE = 0, so it never reaches rx_buffer -- the
+// same drop the old ISR made, and the line's CRC catches the gap. No interrupt is needed.
+// (Measured: marking "the byte before the DMA index" from the error interrupt instead hit
+// the previous, already-read byte -- the errored one was never stored -- and those stale
+// marks refused 27% of later commands.)
+static uint8_t s_rx_seen;          // DMA write index at the previous poll
+static uint32_t s_rx_seen_tick;    // when that index last moved
+
+static uint8_t rx_dma_head(void)
+{
+    // CNDTR counts down from RX_BUFFER_SIZE and reloads (circular mode).
+    return (uint8_t)((RX_BUFFER_SIZE - DMA1_Channel5->CNDTR) % RX_BUFFER_SIZE);
+}
+
+
+#else
+
+static volatile uint8_t rx_head = 0;
+static volatile uint8_t rx_tail = 0;
 
 __attribute__((used)) void USART2_IRQHandler(void)
 {
@@ -54,8 +80,8 @@ __attribute__((used)) void USART2_IRQHandler(void)
         // entry might drain -- check per-byte, before consuming RDR, rather than once
         // for the whole loop. A glitched byte on the line (line noise, or electrical
         // activity from a flash/reset/encoder-probe cycle) would otherwise still get
-        // enqueued as if it were real input -- one stray byte landing on a single-letter
-        // command alias ('h', '?') is enough to execute a real CLI command.
+        // enqueued as if it were real input for the UART update (debug_uart_getc(),
+        // bl_uart_update.c).
         bool had_error = (USART2->ISR & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE | USART_ISR_PE)) != 0;
         uint8_t ch = (uint8_t)(USART2->RDR & 0xFF); // must always read RDR to clear RXNE
         if (had_error) {
@@ -66,25 +92,20 @@ __attribute__((used)) void USART2_IRQHandler(void)
         if (next != rx_tail) {
             rx_buffer[rx_head] = ch;
             rx_head = next;
-            rx_last_tick = HAL_GetTick();
         }
     }
 }
+
+#endif // BUILD_APPLICATION
 
 void debug_init(void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_USART2_CLK_ENABLE();
 
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
 
     // PA2 = USART2_TX, PA3 = USART2_RX (AF1)
-    GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_3;
-    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    GPIO_InitStruct.Alternate = GPIO_AF1_USART2;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    gpio_init(GPIOA, GPIO_PIN_2 | GPIO_PIN_3, GPIO_MODE_AF_PP, GPIO_PULLUP, GPIO_SPEED_FREQ_HIGH, GPIO_AF1_USART2);
 
     // Configure USART2: 115200 baud, Overrun Disabled (OVRDIS). BRR is computed from the
     // actual current PCLK1 rather than a hardcoded constant: debug_init() is called twice
@@ -92,10 +113,34 @@ void debug_init(void)
     // failure in there isn't silent; once after, to finalize for whatever clock that call
     // actually lands on), and a fixed constant can only be correct for one of those two
     // PCLK1 values.
+#ifdef BUILD_APPLICATION
+    debug_tx_drain();   // second call: don't change the baud rate under queued output
+#endif
     USART2->CR1 &= ~USART_CR1_UE;
-    USART2->BRR = (uint16_t)(HAL_RCC_GetPCLK1Freq() / 115200u);
+    USART2->BRR = (uint16_t)(SystemCoreClock / 115200u);   // PCLK1 = SYSCLK: APB is DIV1, from reset on
     USART2->CR3 |= USART_CR3_OVRDIS;
+#ifdef BUILD_APPLICATION
+    // RX by DMA channel 5 (see USART2_IRQHandler above): peripheral to memory, 8-bit,
+    // circular over rx_buffer. Restarted from the top: this runs twice (clock change).
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    DMA1_Channel5->CCR = 0;
+    DMA1_Channel5->CPAR = (uint32_t)&USART2->RDR;
+    DMA1_Channel5->CMAR = (uint32_t)rx_buffer;
+    DMA1_Channel5->CNDTR = RX_BUFFER_SIZE;
+    DMA1_Channel5->CCR = DMA_CCR_MINC | DMA_CCR_CIRC | DMA_CCR_EN;
+    rx_tail = s_rx_seen = 0;
+    // TX by DMA channel 4 (see uart_putc()): memory to peripheral, 8-bit, one chunk at a time.
+    DMA1_Channel4->CCR = 0;
+    DMA1_Channel4->CPAR = (uint32_t)&USART2->TDR;
+    DMA1_Channel4->CCR = DMA_CCR_MINC | DMA_CCR_DIR | DMA_CCR_TCIE;
+    DMA1->IFCR = DMA_IFCR_CGIF4;
+    HAL_NVIC_SetPriority(DMA1_Channel4_5_IRQn, 3, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Channel4_5_IRQn);
+    USART2->CR3 |= USART_CR3_DMAR | USART_CR3_DMAT;
+    USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+#else
     USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE;
+#endif
     USART2->ICR = 0xFFFFFFFF;
     (void)USART2->RDR;
 
@@ -107,11 +152,16 @@ void debug_init(void)
     // away a second same-line edge before the probe ISR samples it. Same tier as
     // SysTick_IRQn (also 3): CLI responsiveness only loses a few ms under real bus-probe
     // activity, which is harmless.
+#ifndef BUILD_APPLICATION   // the application receives by DMA: no USART2 interrupt
     HAL_NVIC_SetPriority(USART2_IRQn, 3, 0);
     HAL_NVIC_EnableIRQ(USART2_IRQn);
+#endif
 }
 
-static char s_debug_log_buf[192];
+// One formatted log line, at most (both buffers below; debug_ring_log() formats into either).
+#define DEBUG_LINE_MAX 192
+
+static char s_debug_log_buf[DEBUG_LINE_MAX];
 
 // debug_ring_log() has its own buffer, separate from debug_log()'s s_debug_log_buf.
 // debug_log() formats into its buffer then transmits it byte-by-byte via a *blocking*
@@ -120,10 +170,10 @@ static char s_debug_log_buf[192];
 // with that slow path; if it shared debug_log()'s buffer, firing mid-transmission would
 // overwrite the buffer while the outer debug_log() loop was still reading from it by index,
 // splicing two messages together mid-word. Independent buffers remove that race.
-static char s_debug_ring_log_buf[192];
+static char s_debug_ring_log_buf[DEBUG_LINE_MAX];
 
 // Minimal vsnprintf covering exactly the conversions this firmware's debug strings use:
-// %s %c %d %u %x %X %%, an optional '0' flag, a decimal field width (numeric conversions
+// %s %c %d %u %X %%, an optional '0' flag, a decimal field width (numeric conversions
 // only -- no call site ever widths a %s), and a length modifier (l/h/z) that is parsed and
 // ignored -- harmless on this 32-bit ILP32 target where int/long are the same width.
 // Replaces newlib-nano's ~1.4KB formatted-output engine (_printf_i / _svfiprintf_r /
@@ -134,7 +184,9 @@ static char s_debug_ring_log_buf[192];
 static int mini_vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
 {
     size_t n = 0;
-    #define MVP_PUT(ch) do { if (n + 1 < size) buf[n] = (char)(ch); n++; } while (0)
+    // ch is evaluated exactly once, room or not: the loops below advance through it
+    // (num[--nlen], *str++), and skipped when the line was full, they never ended.
+    #define MVP_PUT(ch) do { const char c_ = (char)(ch); if (n + 1 < size) buf[n] = c_; n++; } while (0)
 
     for (; *fmt; fmt++) {
         if (*fmt != '%') { MVP_PUT(*fmt); continue; }
@@ -159,7 +211,7 @@ static int mini_vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
 
         switch (conv) {
         // No call site ever passes a field width with %s (checked) -- emit it directly
-        // instead of sharing the numeric width/pad tail below, which only %c/%d/%u/%x/%X
+        // instead of sharing the numeric width/pad tail below, which only %c/%d/%u/%X
         // still need.
         case 's': {
             const char *str = va_arg(ap, const char *);
@@ -170,23 +222,17 @@ static int mini_vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
         case 'c':
             num[nlen++] = (char)va_arg(ap, int);
             break;
-        case 'd': {
-            int v = va_arg(ap, int);
-            unsigned uv;
-            if (v < 0) { neg = 1; uv = (unsigned)(-(long)v); } else { uv = (unsigned)v; }
-            do { num[nlen++] = (char)('0' + uv % 10); uv /= 10; } while (uv);
-            break;
-        }
+        case 'd':
         case 'u': {
             unsigned uv = va_arg(ap, unsigned);
-            do { num[nlen++] = (char)('0' + uv % 10); uv /= 10; } while (uv);
+            if (conv == 'd' && (int)uv < 0) { neg = 1; uv = 0u - uv; }
+            // One division a digit: the remainder from the quotient.
+            do { const unsigned q = uv / 10u; num[nlen++] = (char)('0' + (uv - q * 10u)); uv = q; } while (uv);
             break;
         }
-        case 'x':
-        case 'X': {
+        case 'X': {   // upper case only: no format uses %x
             unsigned uv = va_arg(ap, unsigned);
-            const char *hex = (conv == 'x') ? "0123456789abcdef" : "0123456789ABCDEF";
-            do { num[nlen++] = hex[uv & 0xF]; uv >>= 4; } while (uv);
+            do { num[nlen++] = "0123456789ABCDEF"[uv & 0xF]; uv >>= 4; } while (uv);
             break;
         }
         default:
@@ -218,8 +264,86 @@ static int mini_snprintf(char *buf, size_t size, const char *fmt, ...)
     return r;
 }
 
+#ifdef BUILD_APPLICATION
+// TX by DMA channel 4 (the F030's fixed USART2_TX request) out of a ring: debug_log() and
+// friends queue and return instead of waiting ~87 us a byte for the wire, and only wait
+// when more than TX_BUFFER_SIZE bytes are queued (a dump, say). The transfer-complete
+// interrupt starts the next contiguous chunk. head == tail is empty.
+#define TX_BUFFER_SIZE 256
+static volatile uint8_t s_tx_buf[TX_BUFFER_SIZE];
+static volatile uint16_t s_tx_head;   // next free slot (main loop)
+static volatile uint16_t s_tx_tail;   // first byte not yet sent (chunk done)
+static volatile uint16_t s_tx_len;    // bytes in the chunk in flight; 0 = DMA idle
+
+// Starts the next chunk if the DMA is idle. Callers outside the DMA interrupt mask it first.
+static void tx_start(void)
+{
+    if (s_tx_len || s_tx_head == s_tx_tail) return;
+    const uint16_t end = s_tx_head > s_tx_tail ? s_tx_head : TX_BUFFER_SIZE;
+    s_tx_len = (uint16_t)(end - s_tx_tail);
+    DMA1_Channel4->CCR &= ~DMA_CCR_EN;
+    DMA1_Channel4->CMAR = (uint32_t)&s_tx_buf[s_tx_tail];
+    DMA1_Channel4->CNDTR = s_tx_len;
+    DMA1_Channel4->CCR |= DMA_CCR_EN;
+}
+
+static void tx_chunk_done(void)
+{
+    DMA1->IFCR = DMA_IFCR_CTCIF4;
+    s_tx_tail = (uint16_t)((s_tx_tail + s_tx_len) % TX_BUFFER_SIZE);
+    s_tx_len = 0;
+    tx_start();
+}
+
+// Channel 5 (RX) raises no interrupts; this vector is channel 4's.
+__attribute__((used)) void DMA1_Channel4_5_IRQHandler(void)
+{
+    if (DMA1->ISR & DMA_ISR_TCIF4) tx_chunk_done();
+}
+
+// In an exception handler (the HardFault one) the DMA interrupt can't run: the waits below
+// advance the ring themselves.
+static void tx_poll_in_handler(void)
+{
+    if (__get_IPSR() != 0 && (DMA1->ISR & DMA_ISR_TCIF4)) tx_chunk_done();
+}
+
+// Lines end in "\n" in flash; the wire gets "\r\n" (the CR is added here, a byte per string saved).
 static void uart_putc(char c)
 {
+    if (c == '\n') uart_putc('\r');
+    const uint16_t next = (uint16_t)((s_tx_head + 1) % TX_BUFFER_SIZE);
+    // Full: wait for the DMA, with the polled path's old bound (a few ms at 24 MHz against
+    // ~87 us per byte) so a stuck UART can't hang the caller.
+    uint32_t timeout = 30000;
+    while (next == s_tx_tail && timeout--) {
+        tx_poll_in_handler();
+    }
+    if (next == s_tx_tail) return;
+    s_tx_buf[s_tx_head] = (uint8_t)c;
+    s_tx_head = next;
+    NVIC_DisableIRQ(DMA1_Channel4_5_IRQn);
+    tx_start();
+    NVIC_EnableIRQ(DMA1_Channel4_5_IRQn);
+}
+
+// Everything queued is on the wire: before a reset, or a baud-rate change.
+void debug_tx_drain(void)
+{
+    uint32_t timeout = 600000;   // ~100 ms: a full ring takes ~22 ms
+    while ((s_tx_len || s_tx_head != s_tx_tail) && timeout--) {
+        tx_poll_in_handler();
+    }
+    while (!(USART2->ISR & USART_ISR_TC) && timeout--) {
+        __NOP();
+    }
+}
+
+#else
+
+static void uart_putc(char c)
+{
+    if (c == '\n') uart_putc('\r');   // as above: "\n" in flash, "\r\n" on the wire
     // A raw iteration-count timeout, not the tick: this also runs before SysTick starts and
     // from the fault handler. A few ms at 24 MHz, against ~87 us per byte at 115200 baud.
     uint32_t timeout = 30000;
@@ -231,34 +355,46 @@ static void uart_putc(char c)
     }
 }
 
+#endif // BUILD_APPLICATION
+
+void debug_puts(const char *str)
+{
+    if (str == NULL) return;
+    while (*str) {
+        uart_putc(*str++);
+    }
+}
+
 void debug_log(const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
-    int len = mini_vsnprintf(s_debug_log_buf, sizeof(s_debug_log_buf), fmt, args);
+    mini_vsnprintf(s_debug_log_buf, DEBUG_LINE_MAX, fmt, args);   // always NUL-terminated
     va_end(args);
-    if (len > 0) {
-        if (len >= (int)sizeof(s_debug_log_buf)) {
-            len = (int)sizeof(s_debug_log_buf) - 1;
-        }
-        for (int i = 0; i < len; i++) {
-            uart_putc(s_debug_log_buf[i]);
-        }
-    }
+    debug_puts(s_debug_log_buf);
 }
 
 void debug_ring_log(const char *fmt, ...)
 {
+    // The ring and s_debug_ring_log_buf are the I2C2 ISR's. The UART bridge (`sb`) reaches the
+    // same SMBus handlers from the main loop, where the ISR could pre-empt a line half way
+    // (spliced buffer, or the ISR's line overwritten when the main loop publishes its head):
+    // from the main loop the line goes straight out, as debug_log() does.
+    const bool isr = __get_IPSR() != 0;
+    char *buf = isr ? s_debug_ring_log_buf : s_debug_log_buf;
     va_list args;
     va_start(args, fmt);
-    int len = mini_vsnprintf(s_debug_ring_log_buf, sizeof(s_debug_ring_log_buf), fmt, args);
+    int len = mini_vsnprintf(buf, DEBUG_LINE_MAX, fmt, args);
     va_end(args);
+    if (!isr) {
+        debug_puts(buf);
+        return;
+    }
 
     // vsnprintf returns the length it would have written, not what actually fit --
-    // clamp like debug_log() does, or a format string over 192 chars reads past the
-    // end of s_debug_ring_log_buf below.
-    if (len >= (int)sizeof(s_debug_ring_log_buf)) {
-        len = (int)sizeof(s_debug_ring_log_buf) - 1;
+    // clamped, or a line over DEBUG_LINE_MAX chars reads past the end of the buffer below.
+    if (len >= DEBUG_LINE_MAX) {
+        len = DEBUG_LINE_MAX - 1;
     }
 
     // Whole line or nothing: a line cut off where the ring filled up ran straight into the
@@ -274,6 +410,7 @@ void debug_ring_log(const char *fmt, ...)
         debugBuffer.buffer[head] = s_debug_ring_log_buf[i];
         head = next;
     }
+    ISR_BARRIER();
     debugBuffer.head = head;
 }
 
@@ -282,12 +419,14 @@ void debug_ring_flush(void)
     while(debugBuffer.tail != debugBuffer.head)
     {
         uint16_t tail = debugBuffer.tail;
+        ISR_BARRIER();
         uart_putc(debugBuffer.buffer[tail]);
+        ISR_BARRIER();
         debugBuffer.tail = (tail + 1) % RING_BUFFER_SIZE;
     }
     if (s_ring_dropped) {
         s_ring_dropped = false;
-        debug_puts("[LOG] lost\r\n");
+        debug_puts("[LOG] lost\n");
     }
 }
 
@@ -311,7 +450,7 @@ int debug_uart_getc(void)
 
 // CRC-8 (poly 0x07, init 0) over a NUL-terminated string -- a cheap line-integrity check
 // for the "[<tag>:RAW]" telemetry lines, the bridge's "[SB]"/"R" replies and incoming
-// commands. xhd_tool.py's and xhd_virtual.py's _crc8() mirror this exactly.
+// commands. tools/xhd.py's crc8() mirrors this exactly.
 static uint8_t crc8_str(const char *s)
 {
     uint8_t crc = 0;
@@ -325,9 +464,9 @@ static uint8_t crc8_str(const char *s)
 }
 
 // Emit "[<tag>:RAW] v<ver> <payload> *<crc8(payload)>". `fmt`/args build the payload only;
-// the wrapper (tag / version / CRC / CRLF) lives here, out of every call site. xhd_tool.py's
-// renderer for <tag> checks the version + CRC and falls back to echoing the raw line on any
-// mismatch rather than rendering a corrupted or format-drifted line as if it were valid.
+// the wrapper (tag / version / CRC / CRLF) lives here, out of every call site. A host tool
+// checks the version + CRC and falls back to echoing the raw line on any mismatch rather
+// than rendering a corrupted or format-drifted line as if it were valid.
 static void debug_raw_log(const char *tag, unsigned ver, const char *fmt, ...)
 {
     char buf[160];
@@ -335,19 +474,18 @@ static void debug_raw_log(const char *tag, unsigned ver, const char *fmt, ...)
     va_start(ap, fmt);
     mini_vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    debug_log("[%s:RAW] v%u %s *%02X\r\n", tag, ver, buf, crc8_str(buf));
+    debug_log("[%s:RAW] v%u %s *%02X\n", tag, ver, buf, crc8_str(buf));
 }
 
-// Column headers, section labels, and out-of-range masking are formatted host-side by
-// xhd_tool.py's render_dump(). This function's only job is the I2C burst read. Always
+// Column headers, section labels, and out-of-range masking are formatted host-side. This
+// function's only job is the I2C burst read. Always
 // emits the full 16-byte row (even columns outside [start,end]) -- cheaper than branching
 // on addr here, and the host discards what it doesn't need.
 static void print_dump_range(uint8_t start, uint8_t end)
 {
     for (uint16_t row = (start & 0xF0); row <= end; row += 16) {
         uint8_t row_buf[16] = {0};
-        I2C_HandleTypeDef* hi2c = adv7511_i2c_instance();
-        if (HAL_I2C_Mem_Read(hi2c, ADV7511_MAIN_I2C_ADDR, (uint8_t)row, I2C_MEMADD_SIZE_8BIT, row_buf, 16, 20) != HAL_OK) {
+        if (!i2c1_read(ADV7511_MAIN_I2C_ADDR, (uint8_t)row, row_buf, 16, 20)) {
             memset(row_buf, 0x00, sizeof(row_buf));
         }
         char line[64];
@@ -355,11 +493,11 @@ static void print_dump_range(uint8_t start, uint8_t end)
         for (uint8_t col = 0; col < 16; col++) {
             pos += mini_snprintf(line + pos, sizeof(line) - pos, " %02X", row_buf[col]);
         }
-        debug_log("%s\r\n", line);
+        debug_log("%s\n", line);
     }
 }
 
-// Appended to `d`'s register dump: the fields xhd_tool.py's status/timing/audio/AVI views
+// Appended to `d`'s register dump: the fields a host's status/timing/audio/AVI views
 // need that aren't ADV7511 registers. Those views are all built from one `d`, so a snapshot's
 // fields come from one instant.
 //   st   = state byte: bit0 active_mode_is_bios, bits[3:1] effective colour space (1-4),
@@ -369,9 +507,9 @@ static void print_dump_range(uint8_t start, uint8_t end)
 //   rr   = EEPROM-resolved dashboard refresh (50 / 60 / 0=unknown)
 //   prof = timing-profile index that produced the currently applied timing (0xFF = none yet)
 //   pclk = settled pixel clock in Hz (adv7511_pixel_clock_settled_hz(): a reading held for
-//          200 ms, never a raw sample -- the daemon queries `d` right after mode changes,
+//          200 ms, never a raw sample -- a host tool queries `d` right after mode changes,
 //          when raw reads are 0 or outliers). 0 = no settled reading since the last loss.
-//          Keep the literal "pclk=" token: xhd_daemon.py matches "pclk=0 " on the raw
+//          Keep the literal "pclk=" token: host tools match "pclk=0 " on the raw
 //          response to retry.
 static void print_extras(void)
 {
@@ -407,19 +545,10 @@ static void print_extras(void)
 // The `d` command's whole payload; main.c also prints it after the boot banner.
 void debug_print_full_dump(void)
 {
-    print_dump_range(0x00, 0x59);
+    print_dump_range(0x00, 0x73);   // to the AVI bar data (0x5A-0x61) and Audio InfoFrame byte 1 (0x73)
     print_dump_range(0x90, 0xBA);
     print_dump_range(0xD0, 0xDC);
     print_extras();
-}
-
-// The `sn` toggle's argument. -1 = unrecognized.
-// Character checks rather than strcmp() (flash): "1"/"on" -> 1, "0"/"off" -> 0.
-static int8_t parse_on_off(const char *arg)
-{
-    if (arg[0] == '1' || (arg[0] == 'o' && arg[1] == 'n')) return 1;
-    if (arg[0] == '0' || (arg[0] == 'o' && arg[1] == 'f')) return 0;
-    return -1;
 }
 
 // Replaces strtoul(arg, NULL, 16) for the CLI's register/value/index args --
@@ -451,21 +580,21 @@ static uint16_t parse_dec_u16(const char *s)
 }
 
 // The command name at the start of cmd, followed by end-of-string or a space (a trailing
-// argument), so "d" doesn't fire on "dx" nor "sb" on "sbx". A single-letter name also ends at
-// any control byte. No "h" alias for "help" (see the "?" branch).
+// argument), so "d" doesn't fire on "dx" nor "sb" on "sbx". The line holds no control bytes
+// (debug_cli_poll() keeps 32-126 only). No "h" alias for "help" (see the "?" branch).
 static bool cmd_is(const char *cmd, const char *target)
 {
     const size_t n = strlen(target);
     if (strncmp(cmd, target, n) != 0) return false;
     const char c = cmd[n];   // in bounds: cmd matched n non-NUL bytes
-    return c == '\0' || c == ' ' || (n == 1 && c < ' ');
+    return c == '\0' || c == ' ';
 }
 
 // Every command's bad/missing-argument reply. One fixed string instead of per-command usage
-// text (~150 B of flash); the full syntax is in `xhd_tool.py help`.
+// text (~150 B of flash); the full syntax is in tools/xhd.py -h.
 static void cli_err(void)
 {
-    debug_log("ERR: invalid arg\r\n");
+    debug_log("ERR: invalid arg\n");
 }
 
 // Shared by every command handler below that takes an argument: skip past the matched
@@ -475,14 +604,12 @@ static char *cli_arg(char *cmd, int name_len) {
     while (*a == ' ') a++;
     return a;
 }
-
-void debug_puts(const char *str)
-{
-    if (str == NULL) return;
-    while (*str) {
-        uart_putc(*str++);
-    }
+// The token after the one at p.
+static char *cli_next(char *p) {
+    while (*p && *p != ' ') p++;
+    return cli_arg(p, 0);
 }
+
 
 
 static __attribute__((noinline)) void execute_cli_command(char *raw_cmd, const xbox_encoder xb_encoder)
@@ -505,7 +632,7 @@ static __attribute__((noinline)) void execute_cli_command(char *raw_cmd, const x
     if (*cmd == '\0') return;
 
     // Line integrity: bytes can drop or flip on this UART during a console mode-set burst.
-    // xhd_daemon.py ends every command with " *CC", the CRC-8 of the text before it (as the
+    // tools/xhd.py ends every command with " *CC", the CRC-8 of the text before it (as the
     // RAW lines carry). A mismatch is refused whole -- nothing runs -- and so is an `sb` line
     // without one, since it can change settings, and any line with a '*' that isn't that
     // ending: a lost byte can break the ending itself ("r 57 *60" -> "r 57*60"), and no
@@ -515,73 +642,62 @@ static __attribute__((noinline)) void execute_cli_command(char *raw_cmd, const x
         const uint8_t want = (uint8_t)parse_hex_u32(&cmd[n - 2]);
         cmd[n - 4] = '\0';
         if (crc8_str(cmd) != want) goto crc_err;
-    } else if (strchr(cmd, '*') || cmd_is(cmd, "sb")) {
+    } else if (memchr(cmd, '*', n) || cmd_is(cmd, "sb")) {
         goto crc_err;
     }
 
     char *arg = NULL;
 
-    // Command names are deliberately terse (flash); xhd_tool.py translates the long names
-    // ("status", "info", "timing", ...) before sending. cmd_is() accepts a trailing argument.
+    // Command names are deliberately terse (flash); host tools such as tools/xhd.py map
+    // friendlier names onto them. cmd_is() accepts a trailing argument.
     // ping: link health check with no I2C at all -- tells a dead UART link from a hung I2C
     // bus, which makes every other command time out. The daemon polls it.
     if (cmd_is(cmd, "ping")) {
-        debug_log("PONG\r\n");
+        debug_log("PONG\n");
     }
 #ifdef BUILD_APPLICATION
     // SMBus bridge: `sb r <op> [n]` = n reads of SMBus read opcode <op>, printed as hex,
     // 64 bytes per "[SB] ..." line; `sb w <op> <v> [v...]` = one write per value, in order
     // ("[SB] ok"). op/v hex, n decimal (default 1). Each reply line ends " *CC" (CRC-8 of the
     // text between); an opcode smbus_bridge_*() refuses answers ERR. The settings, config actions, EDID,
-    // telemetry, about, SPD and CEC go through it -- xhd_daemon.py turns the old command names
-    // into these, so their parsing and formatting live host-side, not in flash.
+    // telemetry, about, SPD and CEC go through it, so their parsing and formatting live
+    // host-side, not in flash.
     else if (cmd_is(cmd, "sb")) {
         arg = cli_arg(cmd, 2);
         const bool write = (arg[0] == 'w');
         char *p = cli_arg(arg, 1);
         const uint8_t op = (uint8_t)parse_hex_u32(p);
-        while (*p && *p != ' ') p++;
+        p = cli_next(p);
         if (write) {
-            while (*p == ' ') p++;
             bool ok = true;
             while (*p) {
                 ok &= smbus_bridge_write(op, (uint8_t)parse_hex_u32(p));
-                while (*p && *p != ' ') p++;
-                while (*p == ' ') p++;
+                p = cli_next(p);
             }
             if (!ok) { cli_err(); goto prompt; }
-            debug_log("[SB] ok *%02X\r\n", crc8_str("ok"));
+            debug_log("[SB] ok *%02X\n", crc8_str("ok"));
         } else {
-            uint16_t n = parse_dec_u16(cli_arg(p, 0));
+            uint16_t n = parse_dec_u16(p);
             if (n == 0) n = 1;
             char line[2 * 64 + 1];
             uint8_t k = 0;
             for (uint16_t i = 0; i < n; i++) {
-                static const char hx[] = "0123456789ABCDEF";
                 uint8_t b;
                 if (!smbus_bridge_read(op, &b)) { cli_err(); goto prompt; }
-                line[k++] = hx[b >> 4];
-                line[k++] = hx[b & 0x0F];
+                line[k++] = "0123456789ABCDEF"[b >> 4];   // mini_vsnprintf's literal: one copy
+                line[k++] = "0123456789ABCDEF"[b & 0x0F];
                 if (k == 2 * 64 || i + 1 == n) {
                     line[k] = '\0';
-                    debug_log("[SB] %s *%02X\r\n", line, crc8_str(line));
+                    debug_log("[SB] %s *%02X\n", line, crc8_str(line));
                     k = 0;
                 }
             }
         }
     }
 #endif
-    else if (cmd_is(cmd, "sn")) {
-        arg = cli_arg(cmd, 2);
-        int8_t on_off = parse_on_off(arg);
-        if (on_off >= 0) {
-            smbus_set_sniff(on_off == 1);
-        }
-        debug_log("[SNIFF] %u\r\n", smbus_get_sniff());
-    }
     else if (cmd_is(cmd, "enc")) {
         // Manually force the video encoder (0=Xcalibur 1=Conexant 2=Focus). Word forms
-        // (x/c/f) are normalised by xhd_tool.py. For a board whose passive probe can't
+        // (x/c/f) are normalised host-side. For a board whose passive probe can't
         // catch the encoder and whose BIOS sends no SMBus -- forces + self-latches to
         // page 63, applies immediately. No arg: show current.
         arg = cli_arg(cmd, 3);
@@ -591,9 +707,9 @@ static __attribute__((noinline)) void execute_cli_command(char *raw_cmd, const x
             smbus_force_encoder(enc_addr[*arg - '0']);
         } else if (*arg != '\0') {
             cli_err();
-            goto prompt;   // still answer with the prompt -- the daemon waits for it
+            goto prompt;   // still answer with the prompt -- host tools wait for it
         }
-        debug_log("[ENC] active=%s, probed=0x%02X\r\n",
+        debug_log("[ENC] active=%s, probed=0x%02X\n",
                   get_xbox_encoder_name((uint8_t)xb_encoder),
                   smbus_get_probed_encoder_addr());
     }
@@ -601,10 +717,10 @@ static __attribute__((noinline)) void execute_cli_command(char *raw_cmd, const x
         // Re-arms the passive encoder-address bus probe (smbus_probe.c) -- `enc` shows the
         // result once the console talks to its encoder chip.
         smbus_arm_encoder_probe();
-        debug_log("[PROBE] armed\r\n");
+        debug_log(LOG_PROBE_ARMED);
     }
-    // Three register ranges plus print_extras(): everything xhd_tool.py's status, timing,
-    // audio and AVI views read. The ranges are a host contract (render_dump() hardcodes them);
+    // Three register ranges plus print_extras(): everything a host's status, timing,
+    // audio and AVI views read. The ranges are a host contract (hosts hardcode them);
     // change both sides together. Range 2 reaches 0xBA for 0xAF (HDMI/DVI) and 0xBA (clock
     // delay trim).
     else if (cmd_is(cmd, "d")) {
@@ -612,16 +728,20 @@ static __attribute__((noinline)) void execute_cli_command(char *raw_cmd, const x
     }
     else if (cmd_is(cmd, "w")) {
         arg = cli_arg(cmd, 1);
-        char *val_str = strchr(arg, ' ');
-        if (val_str != NULL) {
-            *val_str = '\0';
-            val_str++;
-            while (*val_str == ' ') val_str++;
+        char *val_str = cli_next(arg);
+        if (*val_str) {
             uint32_t reg = parse_hex_u32(arg);
             uint32_t val = parse_hex_u32(val_str);
-            adv7511_write_register((uint8_t)reg, (uint8_t)val);
-            uint8_t readback = adv7511_read_register((uint8_t)reg);
-            debug_log("W %02X=%02X rd %02X\r\n", (uint8_t)reg, (uint8_t)val, readback);
+            uint8_t readback;
+            // Above FF is the CEC map: 1C2 = CEC 0xC2 (the video data clipping registers live there).
+            if (reg > 0xFF) {
+                adv7511_cec_write_register((uint8_t)reg, (uint8_t)val);
+                readback = adv7511_cec_read_register((uint8_t)reg);
+            } else {
+                adv7511_write_register((uint8_t)reg, (uint8_t)val);
+                readback = adv7511_read_register((uint8_t)reg);
+            }
+            debug_log("W %02X=%02X rd %02X\n", (unsigned)reg, (uint8_t)val, readback);
         } else {
             cli_err();
         }
@@ -630,12 +750,13 @@ static __attribute__((noinline)) void execute_cli_command(char *raw_cmd, const x
         arg = cli_arg(cmd, 1);
         if (*arg != '\0') {
             uint32_t reg = parse_hex_u32(arg);
-            uint8_t val = adv7511_read_register((uint8_t)reg);
-            // "R <reg>=<val> *CC", both hex, CC = CRC-8 of "<reg>=<val>" -- xhd_virtual.py
-            // checks it; scripts/watch_hpd.py and the GUI parse the leading form.
-            char rv[6];
-            mini_snprintf(rv, sizeof(rv), "%02X=%02X", (uint8_t)reg, val);
-            debug_log("R %s *%02X\r\n", rv, crc8_str(rv));
+            uint8_t val = reg > 0xFF ? adv7511_cec_read_register((uint8_t)reg)   // CEC map, as for w
+                                     : adv7511_read_register((uint8_t)reg);
+            // "R <reg>=<val> *CC", both hex, CC = CRC-8 of "<reg>=<val>" -- tools/xhd.py
+            // checks it; other tools parse the leading form.
+            char rv[7];
+            mini_snprintf(rv, sizeof(rv), "%02X=%02X", (unsigned)(reg & 0x1FF), val);
+            debug_log("R %s *%02X\n", rv, crc8_str(rv));
         } else {
             cli_err();
         }
@@ -648,10 +769,7 @@ static __attribute__((noinline)) void execute_cli_command(char *raw_cmd, const x
             // packet); anything else, or omitted, keeps the widescreen bit set (unchanged
             // default -- previously the only option, hardcoded with no way to test 4:3
             // packets from this command at all).
-            char *aspect_arg = arg;
-            while (*aspect_arg && *aspect_arg != ' ') aspect_arg++;
-            while (*aspect_arg == ' ') aspect_arg++;
-            bool force_4_3 = (*aspect_arg == '4');
+            bool force_4_3 = (*cli_next(arg) == '4');
 
             uint32_t mode = ((idx & 0xFF) << 16) | (force_4_3 ? 0 : 0x10000000);
             // Synthesize a matching avinfo (bit 0 as an always-set "populated" marker, bit
@@ -668,7 +786,7 @@ static __attribute__((noinline)) void execute_cli_command(char *raw_cmd, const x
                 // reapply wrapper; this path has neither, so unmute here.
                 adv7511_enable_video();
                 adv7511_unmute_audio();
-                debug_log("[MODE] %02X %s\r\n", (uint8_t)idx, force_4_3 ? "4:3" : "16:9");
+                debug_log(LOG_MODE, (uint8_t)idx, force_4_3 ? "4:3" : "16:9");
             }
         } else {
             cli_err();
@@ -678,15 +796,15 @@ static __attribute__((noinline)) void execute_cli_command(char *raw_cmd, const x
         arg = cli_arg(cmd, 1);
         if (*arg == '0' || *arg == '1') {
             if (*arg == '1') adv7511_power_up_tmds(); else adv7511_power_down_tmds();
-            debug_log("[TMDS] %c\r\n", *arg);
+            debug_log(LOG_TMDS_STATE, *arg);
         } else {
             cli_err();
         }
     }
     else if (cmd_is(cmd, "ep")) {
         // Raw dump of what the passive EEPROM field probe has captured off the console's
-        // own boot-time EEPROM readout (see smbus_probe.c) -- xhd_tool.py decodes the
-        // standard name and settings flags, same RAW/tool-decodes split as tlm/freq/etc.
+        // own boot-time EEPROM readout (see smbus_probe.c) -- a host tool decodes the
+        // standard name and settings flags, the same RAW/host-decodes split as the other RAW lines.
         // valid bit0=VideoStandard captured, bit1=VideoSettings captured; the
         // corresponding 8-hex-digit field is meaningless (not just zero) when its bit is
         // clear, since 0 is itself a real possible VideoStandard/VideoSettings value.
@@ -723,67 +841,73 @@ static __attribute__((noinline)) void execute_cli_command(char *raw_cmd, const x
                                        a[j], r[j], v[j]);
                 }
                 ln[p] = '\0';
-                debug_log("[ENCDUMP]%s\r\n", ln);
+                debug_log("[ENCDUMP]%s\n", ln);
             }
             skip = (uint16_t)(skip + n);
         }
         // lost = writes the decoder never saw (the main loop fell a whole ring behind).
-        debug_log("[ENCDUMP] n=%u total=%u lost=%u\r\n", skip, total,
+        debug_log("[ENCDUMP] n=%u total=%u lost=%u\n", skip, total,
                   smbus_enc_trace_lost());
         if (xbox_xcal_mode_index())
-            debug_log("[ENCDUMP] xcal mode idx=%02X\r\n", xbox_xcal_mode_index());
+            debug_log("[ENCDUMP] xcal mode idx=%02X\n", xbox_xcal_mode_index());
     }
     else if (cmd_is(cmd, "rst")) {
-
+        // "rst rec": into the bootloader's recovery screen, as with a bad image, to test it.
+        if (cmd_is(cmd, "rst rec")) {
+            *BOOTLOADER_FLAG_ADDRESS = BOOTLOADER_RECOVERY_VALUE;
+        }
+        debug_tx_drain();
         NVIC_SystemReset();
     }
     // No single-character "h" alias for help/"?": USART2 TX->RX crosstalk can leave a
     // corrupted "h" fragment in the CLI line buffer (an echoed "xhd> " prompt losing its
     // leading 'x'), and a subsequent command arriving prefixed with '\n' would flush that
     // stray "h" as a real command, racing the actual in-flight command's response.
-    else if (strcmp(cmd, "?") == 0) {   // "help" is mapped to "?" host-side (xhd_daemon.py)
-        // Full command reference lives in scripts/xhd_tool.py ('help' action) -- keeping it
-        // here too would cost ~1KB of flash for text no scripted xhd_tool.py user ever
-        // needs; this breadcrumb is just for a bare serial terminal.
-        debug_puts("see xhd_tool help\r\n");
+    else if (cmd_is(cmd, "?")) {   // "help" is mapped to "?" host-side
+        // The command reference lives in tools/xhd.py (-h) -- keeping it here too would cost
+        // ~1KB of flash for text no scripted user ever needs; this breadcrumb is just for a
+        // bare serial terminal.
+        debug_puts("see xhd.py -h\n");
     }
     else {
         return;
     }
 
 prompt:
-    debug_log("\r\nxhd> ");
+    debug_log("\nxhd> ");
     return;
 crc_err:
-    debug_log("ERR: crc\r\n");
+    debug_log("ERR: crc\n");
     goto prompt;
 }
 
 void debug_cli_poll(const xbox_encoder xb_encoder)
 {
-    // Reset buffer if the line was quiet for > 60ms to purge any line glitches -- a dropped
-    // RX byte (framing/noise error, or the OVRDIS overrun-discard enabled in
-    // debug_init()) can leave a partial line with no terminator stuck here indefinitely.
-    // Quiet is measured from the last byte's arrival (ISR-stamped): a main loop busy for
-    // >60ms between two bytes of one command is not a quiet line. rx_last_tick is read
-    // before the tick so an ISR landing in between can't make the difference wrap.
-    uint32_t last = rx_last_tick;
-    if (cli_pos > 0 && (HAL_GetTick() - last > 60)) {
+    // Reset buffer if the line was quiet for > 60ms to purge any line glitches -- a line
+    // whose terminator never arrived would otherwise sit here indefinitely. Quiet is
+    // measured from when the DMA index last moved, checked before the purge: a main loop
+    // busy for >60ms between two bytes of one command is not a quiet line.
+    const uint8_t head = rx_dma_head();
+    const uint32_t now = HAL_GetTick();
+    if (head != s_rx_seen) {
+        s_rx_seen = head;
+        s_rx_seen_tick = now;
+    }
+    if (cli_pos > 0 && (now - s_rx_seen_tick > 60)) {
         cli_pos = 0;
     }
 
-    while (rx_head != rx_tail) {
+    while (head != rx_tail) {
         uint8_t ch = rx_buffer[rx_tail];
         rx_tail = (uint8_t)((rx_tail + 1) % RX_BUFFER_SIZE);
 
         if (ch == '\r' || ch == '\n') {
             if (cli_pos > 0) {
+                // Run from the line buffer itself: only this main-loop poll fills it, and
+                // not while a command runs.
                 cli_line[cli_pos] = '\0';
-                char cmd_copy[CLI_CMD_MAX_LEN];
-                strncpy(cmd_copy, cli_line, sizeof(cmd_copy) - 1);
-                cmd_copy[sizeof(cmd_copy) - 1] = '\0';
                 cli_pos = 0;
-                execute_cli_command(cmd_copy, xb_encoder);
+                execute_cli_command(cli_line, xb_encoder);
             }
         } else if (ch == '\b' || ch == 0x7F) {
             if (cli_pos > 0) {

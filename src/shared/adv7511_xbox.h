@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __ADV7511_XBOX_H__
 #define __ADV7511_XBOX_H__
 
@@ -50,12 +51,31 @@ void adv7511_apply_wire_vic_mode(void);
 uint8_t adv7511_read_active_vic(void);
 // The VIC actually transmitted: s_wire_vic in honest mode, the chip's 0x3D in auto mode.
 uint8_t adv7511_wire_vic(void);
+// Counts every apply (full or in place); wraps. A deferred settings re-apply compares it to
+// see whether an apply since already took the new setting.
+uint8_t adv7511_apply_count(void);
+// The settled clock has moved over 200 kHz from the one the applied mode was put out on: a
+// raster change the next apply hasn't caught up with. False with no clock to compare.
+bool adv7511_clock_moved_since_apply(void);
 // The timing and AVI widescreen flag last programmed; false if nothing applied since the
 // last chip (re)init.
 bool adv7511_applied_mode(XboxVideoTiming *timing, bool *widescreen);
+// HPD went low (the chip reset its registers): the applied mode stays, its timing on the chip
+// is gone until the next full apply. adv7511_chip_lost_timing(): that state, with a mode applied.
+void adv7511_note_hpd_reset(void);
+bool adv7511_chip_lost_timing(void);
 // The colour space that apply programmed (1 RGB full, 2 RGB limited, 3 YCbCr passthrough,
 // 4 RGB passthrough) -- the wire format, not the setting or a fresh Auto resolution.
 adv_color_space adv7511_applied_color_space(void);
+// The next adv7511_apply_video_timing() is a full one in a TMDS cycle, even on the raster
+// already applied (WRITE_CONFIG_ACTION 3, a forced re-apply).
+void adv7511_request_full_apply(void);
+// The live profile's picture settings (user_config_picture()) onto the running CSC and output clip, in
+// place -- see READ_PICTURE in doc/SMBUS.md. Application only.
+void adv7511_apply_picture(void);
+// The picture profile follows the applied raster's settled clock; call every main-loop pass
+// with adv7511_wire_vic_service().
+void adv7511_picture_profile_service(void);
 // The AVI aspect an apply actually sends: the caller's widescreen request OR the VIC's own
 // 16:9-ness (VIC 4/5 have no 4:3 form, likewise 3/18/22).
 bool timing_ws_infoframe(const XboxVideoTiming * const timing, const bool widescreen);
@@ -67,7 +87,8 @@ void adv7511_refresh_sink_config(void);
 bool adv7511_output_held_for_edid(void);
 // Prints the host-parsed "Actual VIC Sent :" line with adv7511_wire_vic().
 void adv7511_log_vic_sent(void);
-void update_avi_infoframe(const bool widescreen, const uint8_t vic);
+// t: the window's pillarbars for the bar info (t->bar_l/bar_r, t->active_w); NULL = none.
+void update_avi_infoframe(const bool widescreen, const uint8_t vic, const XboxVideoTiming *t);
 void adv7511_set_de_geometry(uint16_t hs_delay, uint16_t vs_delay, uint16_t h_active, uint16_t v_active, uint8_t interlaced_offset);
 void adv7511_set_sync_adjust(bool enable, uint16_t hs_placement, uint16_t hs_duration, uint16_t vs_placement, uint16_t vs_duration);
 // widescreen: the AVI aspect want, including the anamorphic 640-wide 16:9 case (callers
@@ -75,6 +96,10 @@ void adv7511_set_sync_adjust(bool enable, uint16_t hs_placement, uint16_t hs_dur
 // written to 0x3C and read back as active_vic, which the arbiter compares its target
 // against, so it must never be clamped to VIC_00.
 void adv7511_apply_video_timing(const XboxVideoTiming * const timing, const bool widescreen, const bool from_bios);
+// Whether `widescreen` (and its absence) of the next adv7511_apply_video_timing() came from a
+// signal rather than a guess. Known: the AVI InfoFrame's active format says 16:9 or 4:3
+// centre; unknown: "same as the picture" and the display decides. HD is always known.
+void adv7511_set_aspect_known(const bool known);
 bool adv7511_active_mode_is_bios(void);
 // Narrow exception to adv7511_apply_video_timing() being the single choke point that sets
 // this -- see its own comment in the .c. Only for a caller that's independently confirmed

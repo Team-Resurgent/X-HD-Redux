@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "adv7511_xbox.h"
 #include "adv7511_edid.h"
 #include "user_config.h"
@@ -10,40 +11,72 @@ static void invalidate_applied_timing(void);
 // Telemetry counter hooks (application/smbus_i2c.c). Weak: the bootloader has no telemetry.
 extern void smbus_telemetry_note_gate_cycle(void) __attribute__((weak));
 extern void smbus_telemetry_note_mode_apply(void) __attribute__((weak));
+// Application only (xbox_video_standalone.c): the bootloader has no mode-change state.
+extern bool stand_alone_owner_settled(void) __attribute__((weak));
 
 // The encoder's input pixel format, as sniffed (application/smbus_probe.c). Weak: NULL in
 // the bootloader, where Auto keeps its EDID-driven choice.
 extern bool xbox_encoder_input_is_rgb(bool *is_rgb, unsigned char *in_mode_raw) __attribute__((weak));
 
-// Analog Devices "Fixed Registers That Must Be Set" (datasheet Table 14). HPD going low
-// powers the chip down and resets many of them, and they "should be set after power up", so
-// adv7511_reinit_chip() reapplies them every time, not just at boot.
+// Constant register writes, one at a time in table order: {register, value}.
+static void write_regs(const uint8_t (*t)[2], uint8_t n) {
+    for (; n; n--, t++) {
+        adv7511_write_register((*t)[0], (*t)[1]);
+    }
+}
+
+// Analog Devices "Fixed Registers That Must Be Set" (ADV7511 Programming Guide Rev G, Table
+// 14), which "should be set after power up", so adv7511_reinit_chip() reapplies them every
+// time, not just at boot. An HPD low resets 0xF9 (Table 97); the rest keep their values.
+static const uint8_t k_fixed_calibration[][2] = {
+    { 0x98, 0x03 },   // Analog TMDS driver bias current
+    { 0x9A, 0xE0 },   // Internal clock delay trim
+    { 0x9C, 0x30 },   // PLL filter charge pump (ultra-low jitter)
+    { 0x9D, 0x61 },   // Clock divider ratio
+    { 0xA2, 0xA4 },   // TMDS channel drive current (1000mV p-p into 50 ohm)
+    { 0xA3, 0xA4 },   // TMDS clock drive current
+    // Not in Table 14: 0xDE[7:4] and [2:1] "must be set to default", [3] inverts the TMDS clock
+    // (for test equipment). Its power-on value, written so a chip still holding the 0x9C an
+    // earlier firmware set (an MCU-only reset) is put right too.
+    { 0xDE, 0x10 },
+    { 0xE0, 0xD0 },   // Internal PLL lock timing
+    { 0xF9, 0x00 },   // Fixed -- must be 0x00 per datasheet Table 14
+};
 void adv7511_apply_fixed_calibration(void) {
-    adv7511_write_register(0x98, 0x03); // Analog TMDS driver bias current
-    adv7511_write_register(0x9A, 0xE0); // Internal clock delay trim
-    adv7511_write_register(0x9C, 0x30); // PLL filter charge pump (ultra-low jitter)
-    adv7511_write_register(0x9D, 0x61); // Clock divider ratio
-    adv7511_write_register(0xA2, 0xA4); // TMDS channel drive current (1000mV p-p into 50 ohm)
-    adv7511_write_register(0xA3, 0xA4); // TMDS clock drive current
-    adv7511_write_register(0xDE, 0x9C); // TMDS output slew rate control
-    adv7511_write_register(0xE0, 0xD0); // Internal PLL lock timing
-    adv7511_write_register(0xF9, 0x00); // Fixed -- must be 0x00 per datasheet Table 14
+    write_regs(k_fixed_calibration, sizeof k_fixed_calibration / sizeof k_fixed_calibration[0]);
 }
 
 // 0x15: [3:0] input RGB/YCbCr 4:4:4, 12-bit bus DDR; [7:4] audio 48 kHz.
 // 0x16: [7] output 4:4:4, [5:4] 8-bit video, [3:2] video style 1, [1] DDR rising edge,
 // [0] YCbCr. A chip power-cycle resets these along with Table 14, so both are reapplied.
+static const uint8_t k_video_input_format[][2] = {
+    { 0x15, 0b00100101 },
+    { 0x16, 0b00111011 },
+};
 void adv7511_set_video_input_format(void) {
-    adv7511_write_register(0x15, 0b00100101);
-    adv7511_write_register(0x16, 0b00111011);
+    write_regs(k_video_input_format, 2);
+}
+
+// Writes `len` bytes of a packet into Packet Memory at `start`, holding the packet's output on
+// its old bytes meanwhile: its Update bit (bit 7 of `update_reg`) set during the write, then
+// cleared so the chip sends the new ones.
+static void packet_write_held(uint8_t update_reg, uint8_t start, const uint8_t *data, uint16_t len) {
+    uint8_t update = 0b10000000;
+    i2c1_write(ADV7511_PACKET_MEM_I2C_ADDR, update_reg, &update, 1, 20);
+    i2c1_write(ADV7511_PACKET_MEM_I2C_ADDR, start, (uint8_t *)data, len, 20);
+    update = 0x00;
+    i2c1_write(ADV7511_PACKET_MEM_I2C_ADDR, update_reg, &update, 1, 20);
 }
 
 // CEA-861 Source Product Descriptor InfoFrame: the TV labels the input "Xbox", and Source
 // Device Info = Game engages Game Mode / ALLM without a menu change. Static content, so it is
 // only resent after a chip power-cycle (HPD low resets packet memory and the 0x40 enables)
-// and after a hotplug, in case a different sink was connected. Not on a DVI sink.
+// and after a hotplug, in case a different sink was connected. On a DVI sink both packets
+// are turned off: a reconnect's adv7511_ensure_powered_up() sends them with the previous
+// sink's EDID before the new one is read.
 void adv7511_init_spd_infoframe(void) {
     if (!edid_is_hdmi_sink()) {
+        adv7511_update_register(0x40, 0b01000001, 0b00000000);
         return;
     }
 
@@ -59,18 +92,24 @@ void adv7511_init_spd_infoframe(void) {
     memcpy(&spd_packet[4], user_config_get_spd(), XHD_SPD_NAME_LEN);
     spd_packet[28] = 0x08;
 
-    // Freeze SPD output on the current buffer while packet memory is rewritten (Packet
-    // Memory Map 0x1F[7]=1), then release (=0) so the chip resumes from the new bytes and
+    // SPD Update is 0x1F[7]; on its release the chip resumes from the new bytes and
     // recomputes the checksum.
-    uint8_t hold = 0b10000000;
-    HAL_I2C_Mem_Write(adv7511_i2c_instance(), ADV7511_PACKET_MEM_I2C_ADDR, 0x1F, I2C_MEMADD_SIZE_8BIT, &hold, 1, 20);
-    HAL_I2C_Mem_Write(adv7511_i2c_instance(), ADV7511_PACKET_MEM_I2C_ADDR, 0x00, I2C_MEMADD_SIZE_8BIT,
-                      spd_packet, sizeof(spd_packet), 20);
-    uint8_t release = 0x00;
-    HAL_I2C_Mem_Write(adv7511_i2c_instance(), ADV7511_PACKET_MEM_I2C_ADDR, 0x1F, I2C_MEMADD_SIZE_8BIT, &release, 1, 20);
+    packet_write_held(0x1F, 0x00, spd_packet, sizeof(spd_packet));
 
-    // Enable continuous SPD packet transmission (Main Map 0x40[6]=1).
-    adv7511_update_register(0x40, 0b01000000, 0b01000000);
+    // HDMI 2.1 ALLM, to a sink whose EDID lists it: the HDMI Forum VSIF (type 0x81, version 1,
+    // 5 bytes: OUI C4-5D-D8, version 1, ALLM_Mode = 1) in Spare Packet 1 (Packet Memory
+    // 0xC0-0xDE, Programming Guide Table 10). Its checksum (0x7D) is in the table: the guide
+    // says nothing of the chip filling in a spare packet's. Held by Spare Packet 1 Update
+    // (0xDF[7]) while it is written, as the SPD above.
+    const bool allm = edid_supports_allm();
+    if (allm) {
+        static const uint8_t k_hf_vsif[9] = { 0x81, 0x01, 0x05, 0x7D, 0xD8, 0x5D, 0xC4, 0x01, 0x02 };
+        packet_write_held(0xDF, 0xC0, k_hf_vsif, sizeof(k_hf_vsif));
+    }
+
+    // Enable continuous SPD packet transmission (Main Map 0x40[6]=1), and Spare Packet 1
+    // (0x40[0]) only with ALLM: off again for a sink without it (another TV after a hotplug).
+    adv7511_update_register(0x40, 0b01000001, allm ? 0b01000001 : 0b01000000);
 }
 
 // One-time MCU-side setup (I2C1 bring-up); doesn't touch the chip. The chip itself is
@@ -85,15 +124,13 @@ void init_adv(void) {
 static uint8_t s_wire_vic = VIC_00_VIC_Unavailable;
 // Settled clock s_wire_vic was last decided on (0 = none yet for the applied raster).
 static uint32_t s_wire_pclk = 0;
-// 0x3B in WIRE_VIC_HONEST mode: manual pixel repeat [6:5]=10, PR PLL x1 [2:1]=00, PR value
-// x1 [4:3]=00 -- the transmitted VIC is then 0x3C, not the chip's own detection.
-#define ADV_PR_MANUAL_X1 0x40
+// 0x3B in WIRE_VIC_HONEST mode: manual pixel repeat [6:5]=10, PR PLL x1 [4:3]=00, PR value
+// x1 [2:1]=00 -- the transmitted VIC is then 0x3C, not the chip's own detection. In auto mode
+// [6:5]=00. [7] is reserved, power-on 1, and "must be set to default" (Rev G register map).
+#define ADV_PR_MANUAL_X1 0xC0
+#define ADV_PR_AUTO      0x80
 static bool wire_vic_honest(void) {
     return user_config_get()->wire_vic_mode == WIRE_VIC_HONEST;
-}
-
-void adv7511_apply_wire_vic_mode(void) {
-    adv7511_write_register(0x3B, wire_vic_honest() ? ADV_PR_MANUAL_X1 : 0x00);
 }
 
 // Full chip (re)configuration, run once HPD and Monitor Sense are stable -- never while HPD
@@ -143,10 +180,10 @@ void adv7511_reinit_chip(adv7511 *encoder, const xbox_encoder xb_encoder) {
     // [0] Enable DE generation. This is derived from HSYNC,VSYNC for video active framing
     adv7511_update_register(0x17, 0b00000001, 0b00000001);
 
-    // Pixel repetition (clears the default 0x80 Max Mode): manual x1 in honest mode, so the
-    // declared VIC is ours (0x3C, see the wire-VIC policy); auto in WIRE_VIC_AUTO mode (the
-    // chip's own detection). x1 either way. In honest mode 0x3B also serves as the chip-reset
-    // canary for adv7511_read_active_vic(): its power-on value is 0.
+    // Pixel repetition: manual x1 in honest mode, so the declared VIC is ours (0x3C, see the
+    // wire-VIC policy); auto in WIRE_VIC_AUTO mode (the chip's own detection). x1 either way.
+    // In honest mode 0x3B also serves as the chip-reset canary for adv7511_read_active_vic():
+    // its power-on value is 0x80 (auto).
     adv7511_apply_wire_vic_mode();
     s_wire_vic = VIC_00_VIC_Unavailable;
     s_wire_pclk = 0;
@@ -169,7 +206,7 @@ void adv7511_reinit_chip(adv7511 *encoder, const xbox_encoder xb_encoder) {
 
     // Initialize compliant AVI InfoFrame before video output begins
     // to prevent TV from defaulting to RGB and displaying purple/pale screens
-    update_avi_infoframe(false, VIC_02_480p_60__4_3);
+    update_avi_infoframe(false, VIC_02_480p_60__4_3, NULL);
 
     // Static SPD InfoFrame ("Xbox" / Game Mode). No-op on a DVI sink.
     adv7511_init_spd_infoframe();
@@ -207,9 +244,8 @@ void init_adv_audio() {
     // the firmware: the Xbox APU only emits 48kHz, so N is fixed (paired with
     // adv7511_set_video_input_format()'s 0x15[7:4]=48kHz), and adv7511_get_pixel_clock_hz()
     // relies on it being exactly 6144.
-    adv7511_write_register(0x01, 0x00);
-    adv7511_write_register(0x02, 0x18);
-    adv7511_write_register(0x03, 0x00);
+    static const uint8_t k_audio_n[][2] = { { 0x01, 0x00 }, { 0x02, 0x18 }, { 0x03, 0x00 } };
+    write_regs(k_audio_n, 3);
 
     // [6:4] Set SPDIF audio source
     adv7511_update_register(0x0A, 0b01110000, 0b00010000);
@@ -252,7 +288,7 @@ void adv7511_tmds_cycle_begin(void) {
     if (smbus_telemetry_note_gate_cycle) smbus_telemetry_note_gate_cycle();
     uint32_t since_last = HAL_GetTick() - last_tmds_cycle_end;
     if (last_tmds_cycle_end != 0 && since_last < TMDS_BACK_TO_BACK_MS) {
-        debug_log("[TMDS] cycle %lums after previous\r\n", (unsigned long)since_last);
+        debug_log(LOG_TMDS_CYCLE, (unsigned long)since_last);
     }
 
     // Close the input clock gate (0xD6[0]) along with the TMDS outputs, forcing a clean
@@ -385,11 +421,18 @@ bool adv7511_audio_mute_held(void) {
 }
 
 void adv7511_unmute_audio(void) {
-    if (s_audio_mute_hold) return;
+    // Nor in Main Power Down (HPD fell, maybe mid-cycle): the chip drops both writes, and
+    // the reconnect powers up and unmutes itself.
+    if (s_audio_mute_hold || (adv7511_read_register(0x41) & 0x40)) return;
     // S/PDIF input on (normally already on -- covers a path that left it off; idempotent).
     adv7511_update_register(0x0B, 0b10000000, 0b10000000);
-    // Audio Sample Packets back on (see adv7511_mute_audio()).
-    adv7511_update_register(0x44, 0b00100000, 0b00100000);
+    // Audio Sample Packets back on (see adv7511_mute_audio()) -- only into an open gate
+    // (0xD6[0]=0) with the TMDS outputs up (0xA1[5:2]=0). A settings re-apply or reconnect
+    // in the middle of a TMDS cycle turned them on under it; the cycle's AUDIO_WAIT, and the
+    // power-up catch-all through it, unmute once output is back.
+    if (!(adv7511_read_register(0xD6) & 0x01) && !(adv7511_read_register(0xA1) & 0x3C)) {
+        adv7511_update_register(0x44, 0b00100000, 0b00100000);
+    }
 }
 
 static adv_color_space current_color_space = 0;
@@ -452,7 +495,16 @@ adv_color_space adv7511_get_effective_color_space(void) {
             return COLOR_SPACE_RGB_FULL;
         }
     }
+    // Mode 6 needs a sink that takes YCbCr 4:4:4 (HDMI only); otherwise RGB Full, as Auto.
+    if (current_color_space == COLOR_SPACE_YCBCR_CSC && !edid_supports_yuv444()) {
+        return COLOR_SPACE_RGB_FULL;
+    }
     return current_color_space;
+}
+
+// What the sink is told it gets: YCbCr 4:4:4 (AVI Y = 10, Q left Default) or RGB.
+static bool cs_is_ycbcr(const adv_color_space cs) {
+    return cs == COLOR_SPACE_PASSTHROUGH || cs == COLOR_SPACE_YCBCR_CSC;
 }
 
 // Auto names are built from the resolver's own result (index = effective space - 1), so the
@@ -480,12 +532,33 @@ const char* adv7511_get_color_space_name(void) {
             return "Passthrough";
         case COLOR_SPACE_RGB_PASSTHROUGH:
             return "RGB Passthrough";
+        case COLOR_SPACE_YCBCR_CSC:
+            return adv7511_get_effective_color_space() == COLOR_SPACE_YCBCR_CSC ? "YCbCr CSC" : "YCbCr CSC (RGB Full)";
         default:
             return "Unknown";
     }
 }
 
-void update_avi_infoframe(const bool widescreen, const uint8_t vic) {
+// A matrix program_color_space() wrote and left under the Coefficient Update hold: released
+// here, with the InfoFrame that describes it (see adv7511_apply_csc()).
+static bool s_csc_held;
+static void csc_release_held(void) {
+    if (s_csc_held) {
+        s_csc_held = false;
+        adv7511_csc_release();
+    }
+}
+
+// Whether the aspect the next AVI InfoFrame declares came from a signal (see the header).
+// Callers set it just before adv7511_apply_video_timing(); it keeps its value for the
+// re-applies the driver issues itself.
+static bool s_aspect_known;
+static bool s_applied_known;   // the value the InfoFrame on the chip was built with
+void adv7511_set_aspect_known(const bool known) {
+    s_aspect_known = known;
+}
+
+void update_avi_infoframe(const bool widescreen, const uint8_t vic, const XboxVideoTiming *t) {
     bool is_hdmi = edid_is_hdmi_sink();
 
     // [1] HDMI (1) or DVI (0) Mode Select
@@ -493,6 +566,7 @@ void update_avi_infoframe(const bool widescreen, const uint8_t vic) {
 
     // If connected to a legacy DVI monitor, do not send HDMI InfoFrames or Audio packets
     if (!is_hdmi) {
+        csc_release_held();
         return;
     }
 
@@ -504,27 +578,39 @@ void update_avi_infoframe(const bool widescreen, const uint8_t vic) {
 
     adv_color_space eff_cs = adv7511_get_effective_color_space();
 
-    // AVI data bytes DB1-DB5 are registers 0x55-0x59, written as one 5-byte burst.
+    // AVI data bytes DB1-DB13 are registers 0x55-0x61, written as one 13-byte burst.
 
     // DB1 (0x55): [6:5] output format RGB(00)/YCbCr444(10); [4] active-format-info present;
+    // [3:2] bar info: 01 = vertical (pillar) bars valid, when the window has them (Exact);
     // [1:0] scan info: Underscan (10) if supported/PC, Overscan (01), else Default (00).
-    uint8_t out_fmt = (eff_cs == COLOR_SPACE_PASSTHROUGH) ? 0b01000000 : 0b00000000;
+    uint8_t out_fmt = cs_is_ycbcr(eff_cs) ? 0b01000000 : 0b00000000;
     uint8_t scan_mode = user_config_get()->scan_mode;
     uint8_t scan_info = (scan_mode == SCAN_PC)   ? 0b00000010 :   // Underscan / 1:1
                         (scan_mode == SCAN_TV)   ? 0b00000001 :   // Overscan
                         edid_supports_underscan() ? 0b00000010 : 0b00000000;
 
     // DB2 (0x56): [7:6] colorimetry; [5:4] picture aspect 16:9 (10) / 4:3 (01); [3:0] active
-    // format = coded frame (1000). VICs 3/18/22 are 16:9 by definition -- 4:3 next to them is
-    // a protocol violation some sinks reject -- so this holds even for a direct call.
+    // format. When the aspect came from a signal (HD, the console's mode word or AV info, the
+    // encoder's own aspect flag, the user's setting) it is stated: 16:9 centre (1010) or 4:3
+    // centre (1001), so a scaler (RetroTINK 4K) can act on it even where a mode's raster is
+    // not exactly 4:3. When the board only guessed (the EEPROM setting), it says "same as the
+    // coded frame" (1000) and leaves the choice to the display or the user. VICs 3/18/22 are
+    // 16:9 by definition -- 4:3 next to them is a protocol violation some sinks reject -- so
+    // the picture aspect holds even for a direct call.
     const bool aspect_16_9 = widescreen || vic_is_16_9(vic);
+    const uint8_t afd = !(s_aspect_known || is_hd) ? 0b1000 : aspect_16_9 ? 0b1010 : 0b1001;
 
-    // DB3 (0x57): [7] ITC = 1 (IT content: game mode); [3:2] Q, always explicit:
+    // DB3 (0x57): [7] ITC = 1 (IT content: game mode); [3:2] Q, explicit for RGB:
     //  - Full (10) for RGB Full and RGB passthrough -- the GPU's framebuffer output is full
     //    range, and Default would mean Limited on most VICs (crushing 0-15, clipping 236-255);
-    //  - Limited (01) for RGB Limited and YCbCr passthrough -- studio-range data; Default
-    //    would mean Full on VIC 1 and show gray blacks (seen on PAL SD modes).
-    uint8_t q_bits = (eff_cs == COLOR_SPACE_RGB_FULL || eff_cs == COLOR_SPACE_RGB_PASSTHROUGH)
+    //  - Limited (01) for RGB Limited -- studio-range data; Default would mean Full on VIC 1
+    //    and show gray blacks (seen on PAL SD modes);
+    //  - Default (00) for YCbCr (passthrough and mode 6): Q describes RGB only (CEA-861), and
+    //    YQ in DB5 carries the YCbCr range.
+    // CEA-861 wants a non-default Q only from a sink with QS=1; Q is sent regardless, since
+    // sinks were seen honouring it (VIC 1-3, the Auto SD rule).
+    uint8_t q_bits = cs_is_ycbcr(eff_cs) ? 0 :
+                     (eff_cs == COLOR_SPACE_RGB_FULL || eff_cs == COLOR_SPACE_RGB_PASSTHROUGH)
                      ? 0b00001000 : 0b00000100;
 
     // DB4 (0x58): the VIC. Honest mode writes the wire VIC (s_wire_vic). In auto mode the chip
@@ -537,18 +623,37 @@ void update_avi_infoframe(const bool widescreen, const uint8_t vic) {
     // Colorimetry (DB2 [7:6]): No Data (00) on VIC 1 -- 640x480 is IT/VESA content with no
     // YCbCr matrix to describe, and BT.601 there makes some TVs apply broadcast-video
     // processing -- BT.709 (10) on HD, BT.601 (01) on other SD.
-    const uint8_t colorimetry_bits = (vic == VIC_01_VGA_640x480_4_3) ? 0b00000000
+    // A 720 window on internal VIC 1 (Exact 0x0F/0x11) goes out as VIC 2: BT.601 like it.
+    const uint8_t colorimetry_bits = (vic == VIC_01_VGA_640x480_4_3 && !(t && t->active_w == 720)) ? 0b00000000
                                     : is_hd ? 0b10000000 : 0b01000000;
 
-    uint8_t avi_db[5] = {
-        out_fmt | 0b00010000 | scan_info,
-        (uint8_t)(colorimetry_bits | (aspect_16_9 ? 0b00101000 : 0b00011000)),
+    // DB6-DB13 (0x5A-0x61): bar data (CEA-861-D 6.4), counted from pixel 1: the last pixel of the
+    // left bar, the first of the right. Top/bottom stay 0 (no letterbox), and with no bars all
+    // eight are 0, so nothing is left from an Exact mode. Sent only for bars we know of, from
+    // the mode index (xbox_get_video_timing()): BIOS packets, and standalone 0x05/0x12.
+    // Standalone Xcalibur can't see 0x0F/0x11/0x10 -- the encoder writes and the clock are
+    // 0x02's/0x08's/0x04's (seen in recorded SMBus bursts and GPU register reads) -- so they go out as
+    // those 720 modes, with the GPU's black at the sides and no bar data. Guessing would put
+    // bars on a real 0x02/0x08/0x04 picture.
+    const uint16_t elb = t ? t->bar_l : 0;
+    const uint16_t srb = (t && t->bar_r) ? (uint16_t)(t->active_w - t->bar_r + 1u) : 0;
+    uint8_t avi_db[13] = {
+        out_fmt | 0b00010000 | (elb ? 0b00000100 : 0) | scan_info,
+        (uint8_t)(colorimetry_bits | (aspect_16_9 ? 0b00100000 : 0b00010000) | afd),
         (uint8_t)(0b10000000 | q_bits),
         wire_vic_honest() ? s_wire_vic : vic,
         0b00110000,
+        0, 0, 0, 0,
+        (uint8_t)elb, (uint8_t)(elb >> 8), (uint8_t)srb, (uint8_t)(srb >> 8),
     };
-    HAL_I2C_Mem_Write(adv7511_i2c_instance(), ADV7511_MAIN_I2C_ADDR, 0x55,
-                      I2C_MEMADD_SIZE_8BIT, avi_db, 5, 20);
+    i2c1_write(ADV7511_MAIN_I2C_ADDR, 0x55, avi_db, 13, 20);
+    s_applied_known = s_aspect_known;
+
+    // A new matrix goes out with the packet that declares its range: the CSC at the next
+    // Vsync, the packet in the next blanking -- released back to back, the same frame. A
+    // colour change released them apart, and the TV saw the new range under the old
+    // InfoFrame (and a half-written matrix) for a frame or so.
+    csc_release_held();
 
     // [6] End AVI Infoframe Update
     adv7511_update_register(0x4A, 0b01000000, 0b00000000);
@@ -565,7 +670,7 @@ void adv7511_set_de_geometry(uint16_t hs_delay, uint16_t vs_delay, uint16_t h_ac
         (uint8_t)(v_active >> 4),
         (uint8_t)(v_active << 4),
     };
-    HAL_I2C_Mem_Write(adv7511_i2c_instance(), ADV7511_MAIN_I2C_ADDR, 0x35, I2C_MEMADD_SIZE_8BIT, geom_buf, 6, 20);
+    i2c1_write(ADV7511_MAIN_I2C_ADDR, 0x35, geom_buf, 6, 20);
 
     adv7511_write_register(0xDC, (uint8_t)((interlaced_offset & 0x07) << 5));   // 0 when progressive
 }
@@ -582,7 +687,7 @@ void adv7511_set_sync_adjust(bool enable, uint16_t hs_placement, uint16_t hs_dur
             (uint8_t)((uint8_t)(vs_placement << 2) | (uint8_t)(vs_duration >> 8)),
             (uint8_t)(vs_duration),
         };
-        HAL_I2C_Mem_Write(adv7511_i2c_instance(), ADV7511_MAIN_I2C_ADDR, 0xD7, I2C_MEMADD_SIZE_8BIT, sync_buf, 5, 20);
+        i2c1_write(ADV7511_MAIN_I2C_ADDR, 0xD7, sync_buf, 5, 20);
         adv7511_update_register(0x41, 0b00000010, 0b00000010);
     } else {
         adv7511_update_register(0x41, 0b00000010, 0b00000000);
@@ -618,11 +723,23 @@ bool adv7511_any_mode_applied(void) {
 // adv7511_timing_would_change() can skip a TMDS cycle -- a blackout -- for identical state.
 // Common: distinct mode_index values resolve to the same timing (Focus 0x07/0x08/0x11).
 static XboxVideoTiming s_applied_timing;
+static uint8_t s_apply_count;
+static uint32_t s_apply_pclk;   // the settled clock at the last apply (0 = none yet)
 static bool s_applied_ws = false;
 static bool s_applied_valid = false;
 // The colour space the last apply programmed (output format 0x16[0] + CSC): what is on the
 // wire, unlike adv7511_get_effective_color_space(), which re-resolves from live inputs.
 static adv_color_space s_applied_cs = COLOR_SPACE_AUTO;
+
+// HPD went low: the chip reset 0x00-0x93, the applied timing with them, until a full apply
+// rewrites it. The mode is still the applied one -- the reconnect re-pushes it.
+static bool s_chip_lost_timing;
+void adv7511_note_hpd_reset(void) {
+    s_chip_lost_timing = true;
+}
+bool adv7511_chip_lost_timing(void) {
+    return s_chip_lost_timing && s_applied_valid;
+}
 
 // The chip was just reset: nothing it held before counts as applied (see the forward decl).
 static void invalidate_applied_timing(void) {
@@ -704,13 +821,28 @@ static uint8_t wire_vic_for(const XboxVideoTiming * const t, const bool ws_infof
 // Honest mode, every main-loop pass: re-judge the wire VIC from the settled clock and update
 // it in place (0x3C + AVI) when it changes.
 void adv7511_wire_vic_service(void) {
-    if (!wire_vic_honest() || !s_applied_valid || adv7511_tmds_cycle_busy()) {
+    if (!s_applied_valid || adv7511_tmds_cycle_busy()) {
         return;
     }
     // No settled clock (a mode-set disruption, an encoder reset under an unchanged mode) is
     // not evidence of a non-CEA clock -- hold the current wire VIC until a clock settles.
     const uint32_t pclk = adv7511_pixel_clock_settled_hz();
     if (pclk == 0) {
+        return;
+    }
+    // Auto mode: only track the raster's clock, for a switch back to honest. Untracked, the
+    // switch's same-raster re-apply judged it with no clock and sent VIC 0 (seen after a
+    // defaults reset on Focus 720x480).
+    if (!wire_vic_honest()) {
+        s_wire_pclk = pclk;
+        return;
+    }
+    // Not while a mode change is under way, nor its verdict forming -- and when standalone
+    // owns the picture, nor while it has a decision under way (stand_alone_owner_settled()):
+    // the applied raster is the old one, the clock already the new one's, and judged on it the
+    // old 720x480 stepped up to VIC 2 on a 640x576 burst's 27 MHz, and to VIC 3 ahead of
+    // L6's slower 640x576 verdict. The change's own apply re-judges the wire VIC.
+    if (stand_alone_owner_settled && !stand_alone_owner_settled()) {
         return;
     }
     uint8_t w = honest_wire_vic(&s_applied_timing, s_applied_ws, pclk);
@@ -748,8 +880,8 @@ void adv7511_wire_vic_service(void) {
     s_wire_pclk = pclk;
     s_wire_vic = w;
     adv7511_write_register(0x3C, w);
-    update_avi_infoframe(s_applied_ws, s_applied_timing.vic);
-    debug_log("[ADV] wire VIC %u\r\n", w);
+    update_avi_infoframe(s_applied_ws, s_applied_timing.vic, &s_applied_timing);
+    debug_log(LOG_ADV_WIRE_VIC, w);
 }
 
 // Reapply the current mode after the sink changed (EDID retry, hotplug).
@@ -761,6 +893,16 @@ void adv7511_refresh_sink_config(void) {
 
 bool adv7511_output_held_for_edid(void) {
     return s_cycle_stage == TMDS_CYCLE_PLL_POLL && adv7511_tmds_powered_down();
+}
+
+uint8_t adv7511_apply_count(void) {
+    return s_apply_count;
+}
+
+bool adv7511_clock_moved_since_apply(void) {
+    const uint32_t now = adv7511_pixel_clock_settled_hz();
+    if (!now || !s_apply_pclk) return false;
+    return (now > s_apply_pclk ? now - s_apply_pclk : s_apply_pclk - now) > 200000u;
 }
 
 bool adv7511_applied_mode(XboxVideoTiming *timing, bool *widescreen) {
@@ -779,55 +921,268 @@ uint8_t adv7511_wire_vic(void) {
     return wire_vic_honest() ? s_wire_vic : adv7511_read_register(0x3D);
 }
 
-// Exact wording matters: xhd_daemon.py and xhd_gui/server.py both key off "Actual VIC Sent :"
-// (auto-capture trigger / mode-transition tracking), so this string is a host-side contract.
+// Exact wording matters: host tools key off "Actual VIC Sent :" (capture trigger and
+// mode-transition tracking), so this string is a host-side contract.
 // It reports the one VIC on the wire (adv7511_wire_vic()), never the internal VIC; a later
 // honest-mode change from the settled clock is logged by adv7511_wire_vic_service().
 void adv7511_log_vic_sent(void) {
     const uint8_t v = adv7511_wire_vic();
-    debug_log("Actual VIC Sent : VIC %u (0x%02X)\r\n", v, v);
+    debug_log(LOG_VIC_SENT, v, v);
+}
+
+// The wire-VIC mode's registers: 0x3B (pixel repetition; the chip-reset canary in honest
+// mode) and 0x3C to match -- the wire VIC in honest mode, the applied VIC in auto mode, where
+// adv7511_read_active_vic() reads it back. Switching to auto left the honest wire VIC there
+// (0 on a non-CEA raster), and the switch's re-apply read it as "VIC 0" and put out 640x480.
+// Into honest mode the wire VIC is judged afresh: auto mode left the internal VIC in
+// s_wire_vic, and honest mode declared that -- VIC 1 on a 640-wide raster.
+void adv7511_apply_wire_vic_mode(void) {
+    const bool honest = wire_vic_honest();
+    if (honest) {
+        s_wire_vic = s_applied_valid ? honest_wire_vic(&s_applied_timing, s_applied_ws, s_wire_pclk)
+                                     : VIC_00_VIC_Unavailable;
+    }
+    adv7511_write_register(0x3B, honest ? ADV_PR_MANUAL_X1 : ADV_PR_AUTO);
+    adv7511_write_register(0x3C, honest ? s_wire_vic : s_applied_timing.vic);
 }
 
 uint8_t adv7511_read_active_vic(void) {
+    // By the mode on the chip (0x3B), not the setting: a wire-VIC mode switch waits for a
+    // settled picture (settings_wire_vic_mode()), and until then an honest chip's 0x3C is the
+    // wire VIC -- read as the applied one, Exact 0x12 (internal 21, wire 17) looked like VIC 17
+    // applied, and the arbiter held a mode change for L5.
+    if (adv7511_read_register(0x3B) == ADV_PR_MANUAL_X1) {
+        return s_applied_valid ? s_applied_timing.vic : VIC_00_VIC_Unavailable;
+    }
     if (!wire_vic_honest()) {
         return adv7511_read_register(0x3C);   // auto mode: 0x3C still holds the internal VIC
     }
-    // A chip reset (HPD low resets the register map) clears 0x3B to 0 -- reported as VIC_00
+    // A chip reset (HPD low resets the register map) puts 0x3B back to 0x80 -- reported as VIC_00
     // exactly as 0x3C's own reset value used to be, so callers still see "nothing applied".
-    if (adv7511_read_register(0x3B) != ADV_PR_MANUAL_X1 || !s_applied_valid) {
-        return VIC_00_VIC_Unavailable;
-    }
-    return s_applied_timing.vic;
+    return VIC_00_VIC_Unavailable;
 }
 
-// Deferred-cycle fast path (see adv7511_tmds_cycle_begin_deferred()). Same raster as the one
-// on the chip -- everything in XboxVideoTiming equal but the VIC -- means an aspect-only
-// change: 640 anamorphic <-> 4:3 (VIC 1 both ways) or a 4:3/16:9 VIC pair (2/3, 17/18, 21/22).
-// That needs only 0x17[1], the wire VIC (0x3C) and the AVI InfoFrame, which goes out every
-// frame -- so the sink sees it with no TMDS drop and no audio mute. The CSC choice depends
-// on SD vs HD, which the same raster can't change. False (nothing written) when the raster
-// differs or nothing has been applied yet.
-static bool apply_raster_unchanged(const XboxVideoTiming * const timing, const bool widescreen,
-                                   const bool from_bios) {
+// The raster on the chip: something has been applied and `timing` differs from it at most in
+// the VIC, the bars and a few lines of vertical start.
+static bool raster_is_applied(const XboxVideoTiming * const timing) {
+    // The VIC and the bar widths are InfoFrame data, not raster: Exact 0x0F (bars 40/40) -> 0x02
+    // (none) is the same raster, and without this went out in a TMDS cycle with VIC 0.
+    // Nor is a vertical start up to 4 lines away: the GPU draws Xcalibur 0x02/0x08 and Focus
+    // 0x08/0x11 on one line with vsync 1-2 lines apart (read from the GPU's CRTC registers).
+    // apply_raster_unchanged() moves it live -- a 2-line move didn't make the TV resync, a
+    // 34-line one did.
     XboxVideoTiming raster = *timing;
     raster.vic = s_applied_timing.vic;
-    if (!s_applied_valid || memcmp(&raster, &s_applied_timing, sizeof(raster)) != 0) {
+    raster.bar_l = s_applied_timing.bar_l;
+    raster.bar_r = s_applied_timing.bar_r;
+    if (raster.delay_vs + 4u - s_applied_timing.delay_vs <= 8u) raster.delay_vs = s_applied_timing.delay_vs;
+    return s_applied_valid && memcmp(&raster, &s_applied_timing, sizeof(raster)) == 0;
+}
+
+// The clock to judge a same-raster apply's wire VIC on. The settled one -- the arbiter's
+// verdict the service's raster-change hold waits for included; judged on the clock its VIC
+// was judged on, frozen Xcalibur 0x0F -> 0x10 (27.000 -> 23.400 MHz, no CEA format) kept VIC
+// 2 -- or, none settled yet, the one the wire VIC was judged on. 0 (unknown, the
+// service decides) when the live clock has moved off that one: it is the previous mode's, its
+// replacement still settling (Focus 0x08 -> 0x02 declared VIC 2 on 29.455 MHz otherwise).
+// Moved: the service's own 5% (no raster's clock varies that much) on a stable clock; one
+// still settling at 150 kHz, the band check's step (Conexant 0x07 -> 0x02, 27.000 -> 27.378
+// MHz). Only a clock the raster can run on counts: an SD clock under an HD raster
+// is a mode change on its way, and the old VIC stays for the service's hold to judge.
+static bool clock_fits_raster(const XboxVideoTiming * const t, const uint32_t pclk_hz) {
+    return pclk_hz && (t->active_w >= 1280) == (pclk_hz >= 40000000UL);
+}
+static uint32_t same_raster_pclk(const XboxVideoTiming * const t) {
+    const uint32_t settled = adv7511_pixel_clock_settled_hz(), last = adv7511_pixel_clock_last_hz();
+    const uint32_t ref = clock_fits_raster(t, settled) ? settled : s_wire_pclk;
+    if (ref && clock_fits_raster(t, last) &&
+        (last > ref ? last - ref : ref - last) > (adv7511_pixel_clock_stable() ? ref / 20 : 150000UL)) {
+        return 0;
+    }
+    return ref;
+}
+
+// The output format and CSC for a colour space (the full apply's, and a same-raster colour
+// change's). One 24-byte burst: the chip takes a coefficient's high byte only together with
+// its low byte in one transaction.
+// 0x16[0] is the colour space the black image and range clipping assume (programming guide
+// 4.3.7.2), not the output format -- the sink learns that from the AVI InfoFrame's DB1 [6:5]
+// (eff_cs in update_avi_infoframe()). Kept matching the output all the same. A new matrix is
+// left held for update_avi_infoframe() to release with its InfoFrame.
+// The CSC on (every colour space but the two passthroughs).
+static bool csc_on(const adv_color_space cs) {
+    return cs != COLOR_SPACE_PASSTHROUGH && cs != COLOR_SPACE_RGB_PASSTHROUGH;
+}
+
+#ifdef BUILD_APPLICATION
+// The stock table the CSC runs (NULL in a passthrough), for a picture change to refold.
+static const uint8_t *s_csc_table;
+
+// The proc-amp's output clip (picture controls, READ_PICTURE in doc/SMBUS.md): CEC map 0xC0-0xC3, Y/RGB minimum and maximum,
+// and 0xC4-0xC7, Cb/Cr minimum and maximum (YCbCr out only), 12-bit (8-bit code << 4).
+// Programming Guide Rev G Table 66; reset only by CEC power-down. Mode 6's CbCr is held to
+// 1..254, the codes BT.656 leaves legal; anything else gets it open.
+static void write_clip(const uint16_t lo, const uint16_t hi, const bool cbcr) {
+    const uint16_t v[4] = { lo, hi, cbcr ? 0x010 : 0x000, cbcr ? 0xFE0 : 0xFFF };
+    for (uint8_t i = 0; i < 4; i++) {
+        adv7511_cec_write_register((uint8_t)(0xC0 + 2 * i), (uint8_t)(v[i] >> 8));
+        adv7511_cec_write_register((uint8_t)(0xC1 + 2 * i), (uint8_t)v[i]);
+    }
+}
+
+// The stock table with the live profile's picture settings folded in, burst under the hold,
+// and the clip.
+static void program_csc(const uint8_t *table) {
+    const xhd_picture_live *pic = user_config_picture();
+    const procamp_settings *p = &pic->p[pic->profile];
+    const bool ycbcr = table == CscYcbcrIdentity;
+    uint8_t folded[24];
+    s_csc_table = table;
+    procamp_fold(table, p, folded, ycbcr);
+    adv7511_apply_csc(folded);
+    write_clip((uint16_t)(p->black_clip << 4), (uint16_t)(p->white_clip << 4), ycbcr);
+}
+
+// WRITE_PICTURE_APPLY: refold the running table and rewrite the clip, in place. The matrix
+// goes out whole at the next Vsync (the hold); nothing else is touched. A passthrough gets
+// nothing -- its clip stays open (program_color_space() leaves s_csc_table NULL exactly when
+// the CSC is off).
+void adv7511_apply_picture(void) {
+    if (s_csc_table) {
+        program_csc(s_csc_table);
+        adv7511_csc_release();
+    }
+}
+
+// The picture profile (see READ_PICTURE in doc/SMBUS.md) for a raster on a clock: HD rasters are HD; an SD
+// raster is SD only on the CEA clock (27.000 / 27.027 MHz, pclk_near()'s 0.25% each), on any
+// other -- Focus 29.455 and 22.680, Conexant 24.42, 27.378 and 27.562, Xcalibur 20.8, 23.4 and
+// 24.546 MHz -- the non-standard one. No clock (0, an apply: a new raster's settled clock is
+// still the previous one's): an SD raster keeps an SD profile, and from HD starts on SD;
+// adv7511_picture_profile_service() moves it once the clock settles.
+static uint8_t picture_profile(const XboxVideoTiming * const t, const uint32_t pclk_hz) {
+    const uint8_t now = user_config_picture()->profile;
+    if (t->active_w >= 1280) {
+        return PROCAMP_PROFILE_HD;
+    }
+    if (!pclk_hz) {
+        return now == PROCAMP_PROFILE_HD ? PROCAMP_PROFILE_SD : now;
+    }
+    return pclk_hz - 26932500UL <= 27094568UL - 26932500UL ? PROCAMP_PROFILE_SD : PROCAMP_PROFILE_OTHER;
+}
+
+// Every main-loop pass, as the wire-VIC service (and under the same waits): the profile the
+// applied raster's settled clock picks, refolded in place when it moves.
+void adv7511_picture_profile_service(void) {
+    const uint32_t pclk = adv7511_pixel_clock_settled_hz();
+    if (!s_applied_valid || adv7511_tmds_cycle_busy() || !adv7511_pixel_clock_stable() ||
+        !clock_fits_raster(&s_applied_timing, pclk) ||
+        (stand_alone_owner_settled && !stand_alone_owner_settled())) {
+        return;
+    }
+    const uint8_t profile = picture_profile(&s_applied_timing, pclk);
+    if (profile != user_config_picture()->profile) {
+        user_config_picture()->profile = profile;
+        adv7511_apply_picture();
+        debug_log(LOG_PIC_PROFILE, profile);
+    }
+}
+#endif
+
+static void program_color_space(const adv_color_space cs, const bool is_hd) {
+    if (!csc_on(cs)) {
+        // A passthrough: no CSC. YCbCr as the encoder sends it, or RGB input (a GPU/dashboard
+        // driving RGB directly).
+        adv7511_disable_csc();
+        adv7511_update_register(0x16, 0b00000001,
+                                cs == COLOR_SPACE_PASSTHROUGH ? 0b00000001 : 0b00000000); // YCbCr : RGB
+#ifdef BUILD_APPLICATION
+        s_csc_table = NULL;
+        write_clip(0x000, 0xFFF, false);
+#endif
+    } else {
+        adv7511_update_register(0x16, 0b00000001, cs_is_ycbcr(cs) ? 0b00000001 : 0b00000000); // YCbCr : RGB
+        const uint8_t *table = cs == COLOR_SPACE_RGB_LIMITED
+                               ? (is_hd ? CscYuvToRgb709Limited : CscYuvToRgb601Limited)
+                               : (is_hd ? CscYuvToRgb709 : CscYuvToRgb601);
+#ifdef BUILD_APPLICATION
+        if (cs == COLOR_SPACE_YCBCR_CSC) table = CscYcbcrIdentity;
+        program_csc(table);
+#else
+        adv7511_apply_csc(table);
+#endif
+        s_csc_held = true;
+    }
+}
+
+// The wire-VIC mode the last full apply programmed (0x3B pixel repetition).
+static bool s_applied_wv_honest;
+// WRITE_CONFIG_ACTION 3: the next apply is a full one, in a TMDS cycle, raster or not.
+static bool s_full_apply_requested;
+void adv7511_request_full_apply(void) {
+    s_full_apply_requested = true;
+}
+
+// The raster on the chip again -- everything in XboxVideoTiming equal but the VIC -- on a
+// chip that still holds it: only what changed is written, with the link up. An aspect change
+// (640 anamorphic <-> 4:3, a 4:3/16:9 VIC pair: 2/3, 17/18, 21/22) is 0x17[1], the wire VIC
+// (0x3C) and the AVI InfoFrame (bar data too), which goes out every frame; a colour change adds the output
+// format and CSC; scan is the AVI alone. No DE generator toggle, geometry or sync rewrite, no
+// gate, TMDS or audio cycle -- a live rewrite of those blinked a Focus-connected TV and locked
+// it into solid colours during repeated settings re-applies. Through the
+// deferred bracket (adv7511_tmds_cycle_begin_deferred(), `deferred`) it is an arbiter or
+// packet decision; without one, a settings re-apply. False (nothing written) when the raster
+// differs, nothing has been applied, the chip lost it, the wire-VIC mode changed (0x3B
+// changes how the chip sends pixels) or the CSC goes on or off: those take the full apply in
+// a TMDS cycle.
+static bool apply_raster_unchanged(const XboxVideoTiming * const timing, const bool widescreen,
+                                   const bool from_bios, const bool deferred) {
+    // Nor when the chip has lost it: an HPD-low episode resets 0x00-0x93, and only a full apply
+    // restores them. In place left it so, and the arbiter, seeing "nothing applied", re-applied
+    // in place every pass. Known from the disconnect (adv7511_note_hpd_reset()) -- 0x3C reading
+    // VIC 0 alone was fooled once a wire-VIC write restored it (no picture after a reconnect)
+    // -- and from that readback, for a drop too short to be seen.
+    // The raster itself is unchanged: the wire VIC keeps its clock.
+    if (!raster_is_applied(timing) || s_chip_lost_timing || s_full_apply_requested ||
+        wire_vic_honest() != s_applied_wv_honest ||
+        adv7511_read_active_vic() == VIC_00_VIC_Unavailable) {
         return false;
     }
     const bool ws = timing_ws_infoframe(timing, widescreen);
+    // Ahead of the colour decision: the Auto rule reads the VIC.
     s_active_vic = timing->vic;
+    const adv_color_space cs = adv7511_get_effective_color_space();
+    // Nor when the CSC goes on or off (into or out of a passthrough): its enable bit can upset a
+    // live picture (programming guide 4.3.7.3). The full apply sets s_active_vic again.
+    if (csc_on(cs) != csc_on(s_applied_cs)) {
+        return false;
+    }
+    if (cs != s_applied_cs) {
+        program_color_space(cs, vic_is_hd(timing->vic));
+        s_applied_cs = cs;
+    }
     g_active_mode_is_bios = from_bios;
     if (smbus_telemetry_note_mode_apply) smbus_telemetry_note_mode_apply();
+    s_apply_count++;
+    s_apply_pclk = adv7511_pixel_clock_settled_hz();
+    // The vertical start alone, as the `vs` CLI writes it: 0x36[5:0], the HS bits kept.
+    if (timing->delay_vs != s_applied_timing.delay_vs) {
+        adv7511_update_register(0x36, 0x3F, (uint8_t)timing->delay_vs);
+        s_applied_timing.delay_vs = timing->delay_vs;
+    }
     adv7511_update_register(0x17, 0b00000010, ws ? 0b00000010 : 0b00000000);
     // Same raster, so the clock it was last judged on still describes it.
-    const uint32_t settled = adv7511_pixel_clock_settled_hz();
-    s_wire_vic = wire_vic_for(timing, ws, settled ? settled : s_wire_pclk);
+    s_wire_vic = wire_vic_for(timing, ws, same_raster_pclk(timing));
     adv7511_write_register(0x3C, s_wire_vic);
-    update_avi_infoframe(ws, timing->vic);
+    update_avi_infoframe(ws, timing->vic, timing);
     s_applied_timing.vic = timing->vic;
+    s_applied_timing.bar_l = timing->bar_l;
+    s_applied_timing.bar_r = timing->bar_r;
     s_applied_ws = ws;
-    s_cycle_applied_in_place = true;
-    debug_log("[ADV] in-place, raster unchanged\r\n");
+    // Only the deferred bracket's adv7511_tmds_cycle_end() reads it (and clears it): set
+    // without one, it would skip the next real cycle.
+    s_cycle_applied_in_place = deferred;
+    debug_log(deferred ? LOG_ADV_IN_PLACE : LOG_ADV_SETTINGS);
     adv7511_log_vic_sent();
     return true;
 }
@@ -835,15 +1190,30 @@ static bool apply_raster_unchanged(const XboxVideoTiming * const timing, const b
 // Programs a resolved timing -- the one register sequence both the BIOS and standalone paths
 // use.
 void adv7511_apply_video_timing(const XboxVideoTiming * const timing, const bool widescreen, const bool from_bios) {
-    // Deferred bracket (see adv7511_tmds_cycle_begin_deferred()): an unchanged raster is
-    // applied in place, anything else closes the gate now, before any register below.
+    // A full rewrite (DE generator toggle, geometry, sync adjust) only ever goes out in a TMDS
+    // cycle. Deferred bracket (see adv7511_tmds_cycle_begin_deferred()): an unchanged raster
+    // is applied in place, anything else closes the gate now, before any register below. No
+    // bracket and the link up (a settings re-apply, a sink refresh): the same, with the cycle
+    // opened and closed here. With TMDS already down (a caller's own cycle, an EDID hold)
+    // nothing reaches the sink, so the full apply goes straight on.
+    bool own_cycle = false;
     if (s_cycle_deferred) {
         s_cycle_deferred = false;
-        if (apply_raster_unchanged(timing, widescreen, from_bios)) {
+        if (apply_raster_unchanged(timing, widescreen, from_bios, true)) {
             return;
         }
         adv7511_tmds_cycle_begin();
+    } else if (!adv7511_tmds_powered_down()) {
+        if (apply_raster_unchanged(timing, widescreen, from_bios, false)) {
+            return;
+        }
+        // Out of Main Power Down first (a chip an HPD low reset): the cycle's mute is a
+        // 0x00-0x93 write.
+        adv7511_ensure_powered_up();
+        adv7511_tmds_cycle_begin();
+        own_cycle = true;
     }
+    s_full_apply_requested = false;
 
     // First, so the CSC decision below and the AVI InfoFrame both see this mode's VIC.
     s_active_vic = timing->vic;
@@ -856,6 +1226,8 @@ void adv7511_apply_video_timing(const XboxVideoTiming * const timing, const bool
     g_active_mode_is_bios = from_bios;
     g_any_mode_applied = true;
     if (smbus_telemetry_note_mode_apply) smbus_telemetry_note_mode_apply();
+    s_apply_count++;
+    s_apply_pclk = adv7511_pixel_clock_settled_hz();
 
     // Auto Audio Pop/Click Protection: Mute audio while re-programming timing raster
     adv7511_mute_audio();
@@ -863,23 +1235,11 @@ void adv7511_apply_video_timing(const XboxVideoTiming * const timing, const bool
     const bool is_hd = vic_is_hd(timing->vic);
 
     // Apply dynamic color space conversion (Auto EDID, Full Range, Limited Range, or Passthrough)
-    adv_color_space cs = adv7511_get_effective_color_space();
-    s_applied_cs = cs;
-    if (cs == COLOR_SPACE_RGB_PASSTHROUGH) {
-        // Input is already RGB (a GPU/dashboard driving RGB directly) -- no CSC, output RGB. The AVI
-        // InfoFrame's DB1 [6:5] follows from eff_cs in update_avi_infoframe().
-        adv7511_disable_csc();
-        adv7511_update_register(0x16, 0b00000001, 0b00000000); // Output is RGB
-    } else if (cs == COLOR_SPACE_PASSTHROUGH) {
-        adv7511_disable_csc();
-        adv7511_update_register(0x16, 0b00000001, 0b00000001); // Output is YCbCr
-    } else if (cs == COLOR_SPACE_RGB_LIMITED) {
-        adv7511_update_register(0x16, 0b00000001, 0b00000000); // Output is RGB
-        adv7511_apply_csc(is_hd ? (uint8_t *)CscYuvToRgb709Limited : (uint8_t *)CscYuvToRgb601Limited);
-    } else { // COLOR_SPACE_RGB_FULL
-        adv7511_update_register(0x16, 0b00000001, 0b00000000); // Output is RGB
-        adv7511_apply_csc(is_hd ? (uint8_t *)CscYuvToRgb709 : (uint8_t *)CscYuvToRgb601);
-    }
+    s_applied_cs = adv7511_get_effective_color_space();
+#ifdef BUILD_APPLICATION
+    user_config_picture()->profile = picture_profile(timing, 0);
+#endif
+    program_color_space(s_applied_cs, is_hd);
 
     // Force DE Generator re-synchronization to incoming VSync phase across mode switches / soft resets
     adv7511_update_register(0x17, 0b00000001, 0b00000000);
@@ -888,7 +1248,8 @@ void adv7511_apply_video_timing(const XboxVideoTiming * const timing, const bool
     // (HD, 3, 18, 22), so BIOS and standalone can't disagree. Also feeds 0x17[1] below.
     const bool ws_infoframe = timing_ws_infoframe(timing, widescreen);
 
-    // 0x17: [6:5] sync polarity -- positive (00) for HD, negative (11) for SD; [1] aspect,
+    // 0x17: [6:5] sync polarity -- 11 = negative for SD, under sync adjustment; HD runs without
+    // it (sync_adjust_enabled), where 00 passes the encoder's own polarity through; [1] aspect,
     // which only steers the line detector between same-timing VIC pairs (2/3, 17/18, 21/22) so
     // 0x3E reports the right one; [0] DE generator on.
     adv7511_update_register(0x17, 0b01100011,
@@ -907,24 +1268,38 @@ void adv7511_apply_video_timing(const XboxVideoTiming * const timing, const bool
 
     // 0x3C ("VIC Manual"): the wire VIC (see the wire-VIC policy above). In honest mode
     // (manual pixel repeat) the chip transmits exactly this; in auto mode it's ignored by
-    // the chip and only holds the internal VIC for adv7511_read_active_vic().
-    s_wire_vic = wire_vic_for(timing, ws_infoframe, 0);
+    // the chip and only holds the internal VIC for adv7511_read_active_vic(). A new raster is
+    // judged without a clock (the settled one is the previous raster's). The same raster again
+    // -- a colour, scan or aspect re-apply, or an arbiter verdict -- on same_raster_pclk(), so
+    // the VIC doesn't drop to 0 until adv7511_wire_vic_service() restores it.
+    // 0x3B first: pixel repetition for the wire-VIC mode, and in honest mode the chip-reset
+    // canary -- an HPD-low episode or a mode switch since adv7511_reinit_chip() leaves it wrong.
+    // Ahead of the wire VIC below, which overrides the one it judges on the old raster.
+    adv7511_apply_wire_vic_mode();
+    s_wire_vic = wire_vic_for(timing, ws_infoframe, raster_is_applied(timing) ? same_raster_pclk(timing) : 0);
     adv7511_write_register(0x3C, s_wire_vic);
 
-    update_avi_infoframe(ws_infoframe, timing->vic);
+    update_avi_infoframe(ws_infoframe, timing->vic, timing);
 
     s_applied_timing = *timing;
     s_applied_ws = ws_infoframe;
     s_applied_valid = true;
+    s_applied_wv_honest = wire_vic_honest();
+    s_chip_lost_timing = false;
 
     adv7511_log_vic_sent();
+    if (own_cycle) {
+        adv7511_tmds_cycle_end();
+    }
 }
 
 bool adv7511_timing_would_change(const XboxVideoTiming * const timing, const bool widescreen) {
     // Compares the aspect actually sent (ws_infoframe), not the raw argument: a 4:3 request on
     // a 16:9-only VIC programs identically. memcmp is safe because xbox_get_video_timing()
     // zeroes the whole struct, padding included.
-    return !s_applied_valid ||
+    // A chip an HPD low reset holds nothing (a BIOS packet's takeover left it unprogrammed).
+    return !s_applied_valid || s_chip_lost_timing ||
            timing_ws_infoframe(timing, widescreen) != s_applied_ws ||
+           s_aspect_known != s_applied_known ||
            memcmp(timing, &s_applied_timing, sizeof(*timing)) != 0;
 }

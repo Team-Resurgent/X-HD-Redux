@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 // Passive SMBus bus probe: the real-Xbox-encoder-address probe and the factory EEPROM/
 // encoder-format field probe. Electrically and functionally independent of the I2C2
 // hardware slave protocol in smbus_i2c.c: it watches raw SCL/SDA transitions on PB10/PB11
@@ -5,12 +6,14 @@
 // slave command switch except through the public getters/setters in smbus_probe.h.
 // smbus_i2c.c reaches it only through HAL_I2C_AddrCallback's smbus_note_probe_activity()/
 // smbus_note_host_addressed(); main() arms it (smbus_probe_early_init()).
+#include "gpio.h"
 #include "smbus_probe.h"
 #include "smbus_i2c.h"
 #include "stm32.h"
 #include "../shared/debug.h"
 #include "../shared/adv7511_xbox.h"
 #include "../shared/user_config.h"
+#include "../shared/xbox_eeprom_video.h"
 
 // --- Passive real-Xbox-encoder-address bus probe ---
 // Watches raw SCL/SDA transitions on I2C2's own pins (PB10/PB11 -- the same physical pins
@@ -102,7 +105,7 @@ void smbus_check_probed_encoder(xbox_encoder *xb_encoder, bool *encoder_mismatch
     if (probed != 0 && *xb_encoder != (xbox_encoder)probed) {
         smbus_latch_encoder((xbox_encoder)probed, xb_encoder, encoder_mismatch);
         *needs_reapply = true;
-        debug_log("[ENCODER PROBE] confirmed %s\r\n", get_xbox_encoder_name(probed));
+        debug_log(LOG_ENCODER_PROBE_CONFIRMED, get_xbox_encoder_name(probed));
     }
 }
 
@@ -172,9 +175,14 @@ typedef enum {
 // SMC commands. AUDIO_CLAMP 1 = clamp: the console writes it on a reboot, a shutdown or an
 // AV-pack change, and never releases it. A shutdown, never a reboot: the power button writes
 // OS_RESUME = 0x02 (shutdown in progress) first; a software shutdown writes RESET = 0x80 last.
+// A power cycle (RESET = 0x40: dashboards, homebrew, X-HD-Config's reboot) makes the SMC raise
+// the same shutdown interrupt as the power button, and the kernel answers it the same way
+// (0D=02 ~30 ms after the 02=40, then 0D=01) -- so an OS_RESUME = 0x02
+// within SMC_POWERCYCLE_WINDOW_MS of a 02=40 is that power cycle, not a shutdown.
 #define SMC_REG_RESET       0x02
 #define SMC_REG_AUDIO_CLAMP 0x0B
 #define SMC_REG_OS_RESUME   0x0D
+#define SMC_POWERCYCLE_WINDOW_MS 1000u
 
 // Bring-up trace: every register write the console makes to ANY of the three encoder
 // addresses (and to the SMC, for its audio clamp), so an unfamiliar encoder's register writes can be read from one `encdump`
@@ -306,7 +314,7 @@ static uint16_t s_enc_dec_lost = 0;                  // entries overwritten befo
 //   0x07 low byte       SD WSS aspect, written after the raster: NTSC 0x00 4:3 / 0x02 16:9,
 //                       PAL 0x10 4:3 / 0x0E 16:9; the whole register is 0 on 480p and HD.
 // A mode set writes 50 51 52 54 55 56 in that order, so the mode index is derived once 0x56
-// completes and never from a half-written group. 0x02/0x0F, 0x04/0x10 and 0x08/0x11 are
+// completes (or, cut short, once the next register starts) and never from a half-written group. 0x02/0x0F, 0x04/0x10 and 0x08/0x11 are
 // register-identical (the GPU places the 640 picture inside the same 720 window), so they
 // read as 0x02, 0x04 and 0x08.
 #define XCAL_REG_ASPECT     0x07
@@ -319,6 +327,11 @@ static uint8_t  s_xcal_acc_reg;      // its register
 static uint8_t  s_xcal_acc_n;        // bytes in so far
 static uint32_t s_xcal_in_raster, s_xcal_width, s_xcal_out_raster;  // this burst's values
 static uint8_t  s_xcal_mode_index;   // derived at 0x56; 0 = none yet / unrecognised
+static uint32_t s_xcal_index_seq;    // the console's mode-packet sequence at that derive
+// The same for the Focus IHO/IHW and Conexant H_ACTIVE writes ([0] Focus, [1] Conexant); 0, the
+// boot's, until written. See xbox_encoder_width_predates_packet().
+static uint32_t s_width_seq[2];
+static uint8_t  s_xcal_mode_sel;     // 0x56's first byte this mode set
 static uint32_t s_xcal_aspect;       // latest 0x07 value
 static bool     s_xcal_aspect_valid;
 
@@ -330,7 +343,9 @@ static volatile uint8_t eeprom_addr = 0;         // address byte of the transact
 static volatile uint8_t eeprom_cur_offset = 0;   // last offset selected by an 0xA8/enc write
 static volatile uint8_t eeprom_byte_in_txn = 0;  // bytes seen so far in the current read/write
 
+// VideoStandard: bytes as read, then the last read that decodes (see the capture below).
 static volatile uint8_t s_eeprom_video_standard[4] = {0};
+static volatile uint32_t s_eeprom_video_standard_good = 0;
 static volatile uint8_t s_eeprom_video_settings[4] = {0};
 static volatile bool s_eeprom_video_standard_valid = false;
 static volatile bool s_eeprom_video_settings_valid = false;
@@ -383,6 +398,7 @@ static bool    s_cx_wss_valid    = false; // seen at least one 0x60 write this b
 // Latest Conexant RASTER_SEL/HDTV_EN decode (0x2E) -- see CX_REG_RASTER_SEL's own comment
 // above for the register encoding.
 static bool    s_cx_interlaced       = false;
+static uint8_t s_cx_raster_sel       = 0;     // the latest raw 0x2E byte, for xbox_encoder_hd_vic()
 static bool    s_cx_interlaced_valid = false; // seen at least one 0x2E write this boot
 // Bumped on every real 0x2E write, mirroring s_fs_int_prog_epoch -- lets
 // xbox_video_standalone.c's staleness guard (sd_width_debounce_update()) tell "genuinely
@@ -411,8 +427,7 @@ static void smbus_arm_eeprom_probe(void)
 bool xbox_eeprom_get_video_standard(uint32_t *out)
 {
     if (!s_eeprom_video_standard_valid) return false;
-    *out = (uint32_t)s_eeprom_video_standard[0] | ((uint32_t)s_eeprom_video_standard[1] << 8) |
-           ((uint32_t)s_eeprom_video_standard[2] << 16) | ((uint32_t)s_eeprom_video_standard[3] << 24);
+    *out = s_eeprom_video_standard_good;
     return true;
 }
 
@@ -440,8 +455,8 @@ bool xbox_encoder_input_is_rgb(bool *is_rgb, uint8_t *in_mode_raw)
 }
 
 // Passively-sniffed Focus FS454 IHW (Input Horizontal Width) -- see FS_REG_IHW_LO/HI above.
-// Always known: it starts at the chip's power-on 720 (see s_fs_ihw), so callers check the
-// encoder first. The latest assembled raw pixel count the GPU/dashboard programmed (e.g. 640,
+// Starts at the chip's power-on 720 (see s_fs_ihw), so callers check the encoder first; 0
+// after a progressive mode set, which doesn't write it. The latest assembled raw pixel count the GPU/dashboard programmed (e.g. 640,
 // or ~700 for a 720-wide raster).
 uint16_t xbox_focus_get_ihw(void)
 {
@@ -592,8 +607,59 @@ static uint8_t xcal_derive_mode_index(const uint8_t mode_sel)
     }
 }
 
+// The HD mode the encoder was last set to, from its own registers: VIC 4 (720p), VIC 5
+// (1080i) or 0 (not known). 720p and 1080i share 74.25 MHz, so on a blind or untrusted
+// detector this is all that tells them apart. Only meaningful on an HD clock: Focus's bit
+// reads interlaced on SD too. Every recorded SMBus burst:
+//   Xcalibur  mode index 0x0A 720p, 0x0C/0x0D 1080i (raster registers, as on a stock BIOS)
+//   Conexant  0x2E 0xAA 720p, 0xAB 1080i (HDTV_EN + RASTER_SEL 2/3; 480p is 0xAD)
+//   Focus     0x92 bit 7 (INT_PROG) clear 720p (0x2E), set 1080i (0xAE)
+uint8_t xbox_encoder_hd_vic(const xbox_encoder enc)
+{
+    smbus_probe_drain();
+    if (enc == ENCODER_XCALIBUR) {
+        return s_xcal_mode_index == 0x0A ? VIC_04_720p_60_16_9 :
+               (s_xcal_mode_index == 0x0C || s_xcal_mode_index == 0x0D) ? VIC_05_1080i_60_16_9 : 0;
+    }
+    if (enc == ENCODER_CONEXANT) {
+        if (!s_cx_interlaced_valid || !(s_cx_raster_sel & 0x80)) return 0;
+        return (s_cx_raster_sel & 0x03) == 0x02 ? VIC_04_720p_60_16_9 :
+               (s_cx_raster_sel & 0x03) == 0x03 ? VIC_05_1080i_60_16_9 : 0;
+    }
+    if (enc == ENCODER_FOCUS && s_fs_int_prog_valid) {
+        return s_fs_int_prog ? VIC_05_1080i_60_16_9 : VIC_04_720p_60_16_9;
+    }
+    return 0;
+}
+
+// A width register written now (0 Focus IHO/IHW, 1 Conexant H_ACTIVE): under which packet.
+static void note_width_write(const uint8_t i)
+{
+    s_width_seq[i] = get_video_mode_update_sequence();
+}
+
+// The latest width write came before the console's latest mode packet, as for the Xcalibur
+// index below: a mode set whose width writes the sniffer missed keeps the previous mode's
+// width, and it mustn't overrule the new packet. Never written, it's the boot's (Focus IHW
+// reads the chip's power-on 720). False for Xcalibur (see that index).
+bool xbox_encoder_width_predates_packet(const xbox_encoder enc)
+{
+    smbus_probe_drain();
+    const uint8_t i = enc == ENCODER_FOCUS ? 0 : enc == ENCODER_CONEXANT ? 1 : 2;
+    return i < 2 && s_width_seq[i] != get_video_mode_update_sequence();
+}
+
+// The index was derived before the console's latest mode packet: it describes the previous
+// mode set (the packet comes ahead of its own; a set the sniffer couldn't complete never
+// updates it). Doesn't drain: ask right after xbox_xcal_mode_index(), which does.
+bool xbox_xcal_mode_index_predates_packet(void)
+{
+    return s_xcal_mode_index != 0 && s_xcal_index_seq != get_video_mode_update_sequence();
+}
+
 // SMC_EV_* seen since the last call (each once).
 static uint8_t s_smc_events = 0;
+static uint32_t s_smc_powercycle_at;   // tick of the last RESET = 0x40 (0 = none yet)
 uint8_t smbus_smc_events_take(void)
 {
     smbus_probe_drain();
@@ -638,11 +704,19 @@ uint16_t smbus_enc_trace_lost(void)
 }
 
 // One traced encoder write, decoded (main loop, oldest first -- see smbus_probe_drain()).
+static uint32_t s_enc_write_at;   // tick of the latest encoder write decoded (SMC's left out)
+uint32_t smbus_encoder_write_at(void) { smbus_probe_drain(); return s_enc_write_at; }
+
 static void enc_decode(const uint8_t addr, const uint8_t reg, const uint8_t val)
 {
+    if (addr != ADDR_SMC) s_enc_write_at = HAL_GetTick();
     if (addr == ADDR_SMC) {
         if (reg == SMC_REG_AUDIO_CLAMP && val == 0x01) s_smc_events |= SMC_EV_AUDIO_CLAMP;
-        if ((reg == SMC_REG_OS_RESUME && val == 0x02) || (reg == SMC_REG_RESET && val == 0x80))
+        if (reg == SMC_REG_RESET && val == 0x40) s_smc_powercycle_at = HAL_GetTick();
+        const bool cycling = s_smc_powercycle_at != 0 &&
+                             (HAL_GetTick() - s_smc_powercycle_at) < SMC_POWERCYCLE_WINDOW_MS;
+        if ((reg == SMC_REG_OS_RESUME && val == 0x02 && !cycling) ||
+            (reg == SMC_REG_RESET && val == 0x80))
             s_smc_events |= SMC_EV_SHUTDOWN;
         return;
     }
@@ -663,9 +737,11 @@ static void enc_decode(const uint8_t addr, const uint8_t reg, const uint8_t val)
             s_cx_hactive = (uint16_t)((s_cx_hactive & 0xFF00u) | val);
             s_cx_hactive_valid = true;
             s_cx_hactive_epoch++;
+            note_width_write(1);
         } else if (reg == CX_REG_HACTIVE_HI) {   // H_ACTIVE[10:8], masked (see comment above)
             uint16_t hi = (val & CX_REG_HACTIVE_HI_MASK) >> CX_REG_HACTIVE_HI_SHIFT;
             s_cx_hactive = (uint16_t)((s_cx_hactive & 0x00FFu) | (hi << 8));
+            note_width_write(1);
         } else if (reg == CX_REG_WSS_DATA_B0) {
             // See CX_REG_WSS_DATA_B0's own comment for the register/encoding.
             s_cx_wss_b0 = val;
@@ -673,6 +749,7 @@ static void enc_decode(const uint8_t addr, const uint8_t reg, const uint8_t val)
         } else if (reg == CX_REG_RASTER_SEL) {
             // bits[1:0] RASTER_SEL (00 = int-SD/480i), bit7 HDTV_EN (0 = SDTV).
             s_cx_interlaced = ((val & 0x03) == 0x00) && ((val & 0x80) == 0x00);
+            s_cx_raster_sel = val;
             s_cx_interlaced_valid = true;
             s_cx_interlaced_epoch++;
             // WSS (0x60) is an SD-interlaced-only standard (NTSC line 20 / PAL line
@@ -713,8 +790,13 @@ static void enc_decode(const uint8_t addr, const uint8_t reg, const uint8_t val)
         // interlaced mode has the identical risk of bleeding into progressive 480p
         // content that never rewrites it. WSS is only ever transmitted on interlaced
         // video standards, regardless of encoder.
+        // IHW likewise: only interlaced SD mode sets write it (every rig trace), so a progressive
+        // one leaves the last SD mode's -- a 640x480 shorter than its clock's settle left 640 on
+        // 720x480p (0x07), past the width's drift guard. 0 = unknown: the clock decides (the
+        // 480p band separates 640/720).
         if (!s_fs_int_prog) {
             s_fs_wss_valid = false;
+            s_fs_ihw = 0;
         }
     } else if (addr == ADDR_ENC_FS &&
                (reg == FS_REG_IHW_LO || reg == FS_REG_IHW_HI)) {
@@ -729,12 +811,20 @@ static void enc_decode(const uint8_t addr, const uint8_t reg, const uint8_t val)
             s_fs_ihw = (uint16_t)((s_fs_ihw & 0x00FFu) | ((uint16_t)val << 8));
         }
         s_fs_ihw_epoch++;
+        note_width_write(0);
     } else if (addr == ADDR_ENC_FS && reg == FS_REG_IHO_LO) {
         // See FS_REG_IHO_LO above -- latch every write, same reasoning as WSS_DATAF1
         // (expected to change live if the GPU rewrites it per mode switch).
         s_fs_iho = val;
         s_fs_iho_valid = true;
         s_fs_ihw_epoch++;
+        note_width_write(0);
+        // Only interlaced SD mode sets write IHO, ahead of their 0x92 (every rig trace whose
+        // 0x92 survived: interlaced). A missed 0x92 kept the previous 480p's progressive, so
+        // the fresh IHO went unread and a 640x480 after 480p went out 720-wide.
+        s_fs_int_prog = true;
+        s_fs_int_prog_valid = true;
+        s_fs_int_prog_epoch++;
     } else if (addr == ADDR_ENC_FS && reg == FS_REG_WSS_DATAF1_B0) {
         // Latch every write, not just a first-seen one -- expected to change live if
         // the GPU rewrites it per mode/title.
@@ -748,23 +838,34 @@ static void enc_decode(const uint8_t addr, const uint8_t reg, const uint8_t val)
     // register (the ISR already dropped the length byte). A new register, or a fifth byte
     // under the same one, starts the next value.
     if (addr == ADDR_ENC_XCAL) {
+        // 0x56 ends the mode set: when its block completes, or -- cut short by a byte the
+        // sniffer missed -- when the next register starts. Only its
+        // first byte feeds the index, and that one arrives first.
+        bool set_done = false;
         if (reg != s_xcal_acc_reg || s_xcal_acc_n >= 4) {
+            set_done = (s_xcal_acc_reg == XCAL_REG_MODE_SEL && s_xcal_acc_n < 4);
             s_xcal_acc_reg = reg;
             s_xcal_acc_n = 0;
         }
+        if (reg == XCAL_REG_MODE_SEL && s_xcal_acc_n == 0) s_xcal_mode_sel = val;
         s_xcal_acc = (s_xcal_acc >> 8) | ((uint32_t)val << 24);
-        if (++s_xcal_acc_n < 4) return;
-        if (reg == XCAL_REG_IN_RASTER) {
-            s_xcal_in_raster = s_xcal_acc;
-        } else if (reg == XCAL_REG_WIDTH) {
-            s_xcal_width = s_xcal_acc;
-        } else if (reg == XCAL_REG_OUT_RASTER) {
-            s_xcal_out_raster = s_xcal_acc;
-        } else if (reg == XCAL_REG_MODE_SEL) {
-            s_xcal_mode_index = xcal_derive_mode_index((uint8_t)s_xcal_acc);
-        } else if (reg == XCAL_REG_ASPECT) {
-            s_xcal_aspect = s_xcal_acc;
-            s_xcal_aspect_valid = true;
+        if (++s_xcal_acc_n == 4) {
+            if (reg == XCAL_REG_IN_RASTER) {
+                s_xcal_in_raster = s_xcal_acc;
+            } else if (reg == XCAL_REG_WIDTH) {
+                s_xcal_width = s_xcal_acc;
+            } else if (reg == XCAL_REG_OUT_RASTER) {
+                s_xcal_out_raster = s_xcal_acc;
+            } else if (reg == XCAL_REG_MODE_SEL) {
+                set_done = true;
+            } else if (reg == XCAL_REG_ASPECT) {
+                s_xcal_aspect = s_xcal_acc;
+                s_xcal_aspect_valid = true;
+            }
+        }
+        if (set_done) {
+            s_xcal_mode_index = xcal_derive_mode_index(s_xcal_mode_sel);
+            s_xcal_index_seq = get_video_mode_update_sequence();
         }
     }
 }
@@ -853,7 +954,17 @@ static void eeprom_probe_scl_edge(void)
         const uint16_t reg = (uint16_t)eeprom_cur_offset + k;
         if (reg >= XBOX_EEPROM_VIDEO_STANDARD_OFFSET && reg < XBOX_EEPROM_VIDEO_STANDARD_OFFSET + 4) {
             s_eeprom_video_standard[reg - XBOX_EEPROM_VIDEO_STANDARD_OFFSET] = b;
-            if (reg == XBOX_EEPROM_VIDEO_STANDARD_OFFSET + 3) s_eeprom_video_standard_valid = true;
+            // Only a standard that decodes: one misread byte (a PAL-I 0x00800300 read as
+            // 0x00800000) was taken as valid and decided the region NTSC. A misread keeps the
+            // last good capture, or none -- the region then comes from the signal.
+            if (reg == XBOX_EEPROM_VIDEO_STANDARD_OFFSET + 3) {
+                const uint32_t v = (uint32_t)s_eeprom_video_standard[0] | ((uint32_t)s_eeprom_video_standard[1] << 8) |
+                                   ((uint32_t)s_eeprom_video_standard[2] << 16) | ((uint32_t)b << 24);
+                if (xbox_eeprom_decode_video_standard(v) != XBOX_EEPROM_VIDEO_STD_UNKNOWN) {
+                    s_eeprom_video_standard_good = v;
+                    s_eeprom_video_standard_valid = true;
+                }
+            }
         }
         if (reg >= XBOX_EEPROM_VIDEO_SETTINGS_OFFSET && reg < XBOX_EEPROM_VIDEO_SETTINGS_OFFSET + 4) {
             s_eeprom_video_settings[reg - XBOX_EEPROM_VIDEO_SETTINGS_OFFSET] = b;
@@ -968,12 +1079,7 @@ void smbus_probe_early_init(void)
     // PB10/PB11 as plain pulled-up inputs so the EXTI input path is live. smbus_i2c_init()
     // later switches them to AF1 open-drain for the I2C2 peripheral -- EXTI edge detection
     // samples the raw pin level and keeps working across that.
-    GPIO_InitTypeDef gpio = {0};
-    gpio.Pin = GPIO_PIN_10 | GPIO_PIN_11;
-    gpio.Mode = GPIO_MODE_INPUT;
-    gpio.Pull = GPIO_PULLUP;
-    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(GPIOB, &gpio);
+    gpio_init(GPIOB, GPIO_PIN_10 | GPIO_PIN_11, GPIO_MODE_INPUT, GPIO_PULLUP, GPIO_SPEED_FREQ_HIGH, 0);
 
     // EXTI by register, not HAL_GPIO_Init(GPIO_MODE_IT_x): that sets MODER, which would undo
     // I2C2's AF1 if it ran after smbus_i2c_init().

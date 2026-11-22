@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "user_config.h"
 #include "flash.h"
 #include "adv7511.h"
@@ -6,9 +7,15 @@
 
 static xhd_user_config g_config;
 
-// Statically initialized to XHD_SPD_DEFAULT so the bootloader, which never runs
-// user_config_init(), sends the factory names too.
+// The bootloader never runs user_config_init(), so its copy starts as XHD_SPD_DEFAULT and it
+// sends the factory names too; the application's is set there (one copy of the string).
+#ifdef BUILD_APPLICATION
+static xhd_spd_config g_spd;
+#else
 static xhd_spd_config g_spd = { .name = XHD_SPD_DEFAULT };
+#endif
+// Set by user_config_load() or user_config_restore_defaults() before anything reads it.
+static xhd_picture_live g_picture;
 
 static uint32_t checksum_bytes(const void *p, size_t len)
 {
@@ -38,6 +45,45 @@ bool user_config_set_spd(const uint8_t *name)
         }
     }
     memcpy(g_spd.name, name, XHD_SPD_NAME_LEN);
+    return true;
+}
+
+xhd_picture_live *user_config_picture(void)
+{
+    return &g_picture;
+}
+
+static void picture_neutral(void)
+{
+    for (uint8_t i = 0; i < PROCAMP_PROFILES; i++) {
+        g_picture.p[i] = (procamp_settings)PROCAMP_NEUTRAL;
+    }
+}
+
+// Ranges as documented for READ_PICTURE in doc/SMBUS.md.
+static bool picture_valid(const procamp_settings *p)
+{
+    if (p->white_clip < 128 || p->black_clip > 64 || p->contrast < 50 || p->contrast > 150 ||
+        p->brightness < -64 || p->brightness > 64 || p->chroma_cos < 0 || p->chroma_cos > 8192 ||
+        p->chroma_sin < -8192 || p->chroma_sin > 8192) {
+        return false;
+    }
+    for (uint8_t r = 0; r < 3; r++) {
+        if (p->gain[r] < 50 || p->gain[r] > 150 || p->bias[r] < -32 || p->bias[r] > 32) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool user_config_set_picture(const uint8_t *bytes)
+{
+    procamp_settings p;
+    memcpy(&p, bytes + 1, sizeof p);
+    if (bytes[0] >= PROCAMP_PROFILES || !picture_valid(&p)) {
+        return false;
+    }
+    g_picture.p[bytes[0]] = p;
     return true;
 }
 
@@ -108,9 +154,9 @@ void user_config_restore_defaults(xbox_encoder xb_encoder)
     memset(&g_config, 0, sizeof(xhd_user_config));
     g_config.magic = XHD_CONFIG_MAGIC;
     memcpy(g_spd.name, XHD_SPD_DEFAULT, XHD_SPD_NAME_LEN);
-    g_config.color_space = COLOR_SPACE_AUTO;
-    g_config.aspect_ratio = ASPECT_RATIO_AUTO;
-    g_config.scan_mode = SCAN_AUTO;
+    picture_neutral();
+    // color_space/aspect_ratio/scan_mode: Auto, which the memset left (Auto is 0 in each).
+    _Static_assert(COLOR_SPACE_AUTO == 0 && ASPECT_RATIO_AUTO == 0 && SCAN_AUTO == 0, "Auto is the zeroed setting");
 
     // profile[] arrays are already all-zero from the memset above -- no per-profile
     // hs/vs calibration by default.
@@ -151,6 +197,12 @@ bool user_config_load(void)
     if (g_config.wire_vic_mode > WIRE_VIC_AUTO) {
         g_config.wire_vic_mode = WIRE_VIC_HONEST;
     }
+    if (g_config.sd_exact > 1) {
+        g_config.sd_exact = 0;
+    }
+    if (g_config.cec_standby_off > 2) {
+        g_config.cec_standby_off = 0;
+    }
     if (g_config.scan_mode > SCAN_PC) {
         g_config.scan_mode = SCAN_AUTO;
     }
@@ -161,6 +213,19 @@ bool user_config_load(void)
         if (g_config.enc_cal[i].clock_phase > 7) {
             g_config.enc_cal[i].clock_phase = k_default_phase[i];
         }
+    }
+
+    // Picture block (after the SPD block): its own checksum, so it loads or defaults on its own.
+    const xhd_picture_config *flash_pic = (const xhd_picture_config *)
+        (XHD_CONFIG_FLASH_ADDR + sizeof(xhd_user_config) + sizeof(xhd_spd_config));
+    bool pic_ok = flash_pic->checksum == checksum_bytes(flash_pic->p, sizeof flash_pic->p);
+    for (uint8_t i = 0; i < PROCAMP_PROFILES; i++) {
+        pic_ok = pic_ok && picture_valid(&flash_pic->p[i]);
+    }
+    if (pic_ok) {
+        memcpy(g_picture.p, flash_pic->p, sizeof g_picture.p);
+    } else {
+        picture_neutral();
     }
 
     // The colour space is firmware state; the clock phase reaches the chip through
@@ -180,13 +245,15 @@ bool user_config_save(void)
     g_config.checksum = calculate_checksum(&g_config);
     g_spd.checksum = checksum_bytes(g_spd.name, XHD_SPD_NAME_LEN);
 
-    // One contiguous image: xhd_user_config exactly where it always was, SPD block after it
-    // (see xhd_spd_config's comment in user_config.h).
+    // One contiguous image: xhd_user_config exactly where it always was, then the SPD and
+    // picture blocks (see xhd_spd_config's comment in user_config.h).
     #pragma pack(push, 1)
-    struct { xhd_user_config cfg; xhd_spd_config spd; } page;
+    struct { xhd_user_config cfg; xhd_spd_config spd; xhd_picture_config pic; } page;
     #pragma pack(pop)
     page.cfg = g_config;
     page.spd = g_spd;
+    memcpy(page.pic.p, g_picture.p, sizeof page.pic.p);
+    page.pic.checksum = checksum_bytes(page.pic.p, sizeof page.pic.p);
 
     // Already in flash as-is: skip the erase. The F030's pages are rated for 1k cycles,
     // and a host that saves on every exit would otherwise wear page 63 for nothing.
@@ -201,7 +268,7 @@ bool user_config_save(void)
 
     if (!flash_erase_page(XHD_CONFIG_FLASH_PAGE) ||
         !flash_write_page(XHD_CONFIG_FLASH_PAGE, (uint8_t*)&page, sizeof(page))) {
-        debug_log("[CONFIG] save failed\r\n");
+        debug_log(LOG_CONFIG_SAVE_FAILED);
         return false;
     }
 
@@ -216,16 +283,16 @@ bool user_config_save(void)
 void user_config_init(xbox_encoder xb_encoder)
 {
     if (user_config_load()) {
-        debug_log("[CONFIG] loaded (phase %u, %s)\r\n",
+        debug_log(LOG_CONFIG_LOADED,
                   g_config.enc_cal[g_config.active_encoder].clock_phase, get_xbox_encoder_name(xb_encoder));
     } else {
         user_config_restore_defaults(xb_encoder);
-        debug_log("[CONFIG] defaults (none saved)\r\n");
+        debug_log(LOG_CONFIG_DEFAULTS);
     }
 
     // SPD block: independent of xhd_user_config's own validity. Absent (erased 0xFF, or
-    // a page last written by older firmware), bad checksum or non-printable -> keep the
-    // defaults already in g_spd.
+    // a page last written by older firmware), bad checksum or non-printable -> the defaults.
+    memcpy(g_spd.name, XHD_SPD_DEFAULT, XHD_SPD_NAME_LEN);
     const xhd_spd_config *flash_spd =
         (const xhd_spd_config *)(XHD_CONFIG_FLASH_ADDR + sizeof(xhd_user_config));
     if (flash_spd->checksum == checksum_bytes(flash_spd->name, XHD_SPD_NAME_LEN)) {
@@ -242,7 +309,7 @@ void user_config_set_active_encoder(xbox_encoder xb_encoder)
 {
     g_config.active_encoder = (uint8_t)user_config_get_encoder_index(xb_encoder);
     if (user_config_save()) {
-        debug_log("[CONFIG] self-latched %s\r\n", get_xbox_encoder_name(xb_encoder));
+        debug_log(LOG_CONFIG_SELF_LATCHED, get_xbox_encoder_name(xb_encoder));
     }
 }
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
 #include <stdbool.h>
@@ -11,7 +12,10 @@
 uint32_t crc32_buf(const uint8_t *data, uint32_t len);
 
 // CRC a region of flash by absolute address, no copy.
-uint32_t crc32_flash(uint32_t start_addr, uint32_t len);
+static inline uint32_t crc32_flash(uint32_t start_addr, uint32_t len)
+{
+    return crc32_buf((const uint8_t *)(uintptr_t)start_addr, len);
+}
 
 // CRC `data_size` bytes starting at `start_addr` while copying them into `data`.
 // Used by the SMBus page-readback path (WRITE_READ_PAGE, both images' smbus_i2c.c).

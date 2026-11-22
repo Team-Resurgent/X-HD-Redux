@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
 #define DEBUG_OUT
@@ -6,6 +7,7 @@
 #include <stdbool.h>
 #include "types.h"
 #include "defines.h"
+#include "log_codes.h"   // debug_log(LOG_...): coded lines, expanded host-side
 
 #ifdef DEBUG_OUT
 
@@ -22,6 +24,9 @@ void debug_print_full_dump(void);
 // application drains the same ring via debug_cli_poll().
 #ifndef BUILD_APPLICATION
 int debug_uart_getc(void);
+#else
+// Waits until everything queued for the UART (sent by DMA) is out: before a reset.
+void debug_tx_drain(void);
 #endif
 
 #else

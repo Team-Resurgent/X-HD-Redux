@@ -124,9 +124,13 @@ static void GetVideoFormat(int *width, int *height, const char **refresh, const 
     }
 
     // Aspect ratio: HD modes (720p, 1080i) are 16:9. For SD, bit 28 (0x10000000) of the
-    // mode dword is the widescreen (WSS) flag.
+    // mode dword is the widescreen (WSS) flag. 480p is blank: the console sends the same
+    // dword for 4:3 and 16:9 there (the title's choice is only in Direct3D's AV info word,
+    // which a DXT cannot read), so any aspect shown would be a guess.
     if (w >= 1280) {
         *aspect = "16:9";
+    } else if (mode != 0 && (mode & 0xC0000000) == 0x80000000) {
+        *aspect = "";
     } else if (mode != 0) {
         *aspect = (mode & 0x10000000) ? "16:9" : "4:3";
     } else {
@@ -212,9 +216,10 @@ static BOOL ReadXhdVideoInfo(XHD_VIDEO_INFO *outInfo)
     if (vi.struct_version != 1 || vi.struct_size != sizeof(XHD_VIDEO_INFO)) {
         return FALSE;
     }
+    // color_space isn't checked: a value this build doesn't know shows as "CS<n>" rather than
+    // dropping the whole snapshot (6, YCbCr Adjustable, once hid the X-HD line entirely).
     if ((vi.flags & XHD_VI_APPLIED) &&
-        (vi.width < 320 || vi.width > 1920 || vi.height < 240 || vi.height > 1080 ||
-         vi.color_space > 5)) {
+        (vi.width < 320 || vi.width > 1920 || vi.height < 240 || vi.height > 1080)) {
         return FALSE;
     }
 
@@ -313,8 +318,9 @@ static void UpdateFramebuffer(unsigned char *framebuffer)
     if (resWidth <= 1 || resHeight <= 1) {
         snprintf(message, MAX_PATH, "%s Fmem: %u/%u", fpsStr, freeMb, totalMb);
     } else {
-        snprintf(message, MAX_PATH, "%s RES: %ix%i %s %s Fm: %u/%u",
-                 fpsStr, resWidth, resHeight, refresh, aspect, freeMb, totalMb);
+        snprintf(message, MAX_PATH, "%s RES: %ix%i %s%s%s Fm: %u/%u",
+                 fpsStr, resWidth, resHeight, refresh, aspect[0] ? " " : "", aspect,
+                 freeMb, totalMb);
     }
 
     // Render Line 1 into offscreen backbuffer
@@ -327,6 +333,7 @@ static void UpdateFramebuffer(unsigned char *framebuffer)
         char refreshStr[32];
         const char *xhd_aspect = (s_cached_vi.flags & XHD_VI_WIDESCREEN) ? "16:9" : "4:3";
         const char *csc_str = "None";
+        char cscBuf[8];
 
         // X-HD's own values only -- never the console's, or a mismatch would be hidden.
         int w = (int)s_cached_vi.width;
@@ -349,7 +356,11 @@ static void UpdateFramebuffer(unsigned char *framebuffer)
             case 2: csc_str = "RGB-Limited"; break;
             case 3: csc_str = "YCbCr-Pass"; break;
             case 4: csc_str = "RGB-Pass"; break;
-            default: csc_str = "None"; break;
+            case 6: csc_str = "YCbCr-Adj"; break;
+            default:
+                sprintf(cscBuf, "CS%u", (unsigned int)s_cached_vi.color_space);
+                csc_str = cscBuf;
+                break;
         }
 
         if (!(s_cached_vi.flags & XHD_VI_APPLIED)) { // the mode fields aren't valid

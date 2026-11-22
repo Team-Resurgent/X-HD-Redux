@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __XBOX_VIDEO_TIMING_H__
 #define __XBOX_VIDEO_TIMING_H__
 
@@ -17,10 +18,17 @@ typedef struct {
     uint16_t vsync_placement;
     uint16_t vsync_duration;
     uint8_t  vic;
+    uint8_t  bar_l, bar_r;   // black pixels the window adds left/right of the picture (Exact), for
+                             // the AVI bar info; 0 = none
 } XboxVideoTiming;
 
+// A mode's table timing for `encoder`, before calibration (xbox_timing_rows.c, in both
+// images). False if mode_index isn't a mode.
+bool xbox_base_timing(xbox_encoder encoder, uint8_t mode_index, bool widescreen, XboxVideoTiming *timing);
+
 // Derives exact video timing parameters for the ADV7511 from encoder, mode index (1 to 0x12,
-// plus the standalone synthetics 0x13-0x15) and widescreen flag
+// plus the standalone synthetics 0x13-0x15) and widescreen flag: xbox_base_timing() plus the
+// per-profile calibration (application only)
 bool xbox_get_video_timing(xbox_encoder encoder, uint8_t mode_index, bool widescreen, XboxVideoTiming *timing);
 
 // Mode 0x04's (PAL 720x480 @ 50 Hz) base HS delay for `encoder`, before calibration -- the
@@ -39,6 +47,9 @@ bool xbox_get_standalone_timing(xbox_encoder encoder, uint8_t standalone_mode, b
 // (16:9 or 4:3) wins; ASPECT_RATIO_AUTO falls back to the caller's signal-derived guess.
 // HD callers must not use this -- HD is 16:9 by format regardless of the setting.
 bool sd_resolve_widescreen(xbox_encoder encoder, bool signal_widescreen);
+// True when sd_resolve_widescreen() answers from something told to the board (the user's
+// setting, or the encoder's live aspect) rather than the EEPROM guess.
+bool sd_aspect_known(xbox_encoder encoder);
 
 // The mode_index of a console mode dword (bits 23:16): SMBus packets and the sniffed dword.
 static inline uint8_t xbox_mode_index(uint32_t mode_dword) {

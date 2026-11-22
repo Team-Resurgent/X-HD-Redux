@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __ADV7511_EDID_H__
 #define __ADV7511_EDID_H__
 
@@ -18,6 +19,8 @@ bool edid_is_hdmi_sink(void);
 uint16_t edid_cec_physical_address(void);
 bool edid_supports_yuv444(void);
 bool edid_supports_underscan(void);
+// The sink takes HDMI 2.1 ALLM (Auto Low Latency Mode) in the HF-VSIF.
+bool edid_supports_allm(void);
 const uint8_t* edid_get_raw_buffer(void);
 
 #endif // __ADV7511_EDID_H__

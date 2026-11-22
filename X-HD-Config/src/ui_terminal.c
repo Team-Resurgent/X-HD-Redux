@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #include "ui_terminal.h"
 #include "d3d_font.h"
 #include <stdio.h>
@@ -6,12 +7,16 @@
 
 static D3DDevice  *g_pDevice = NULL;
 
-static int g_screenWidth  = 1280;
-static int g_screenHeight = 720;
-static int g_marginLeft   = 80;
-static int g_marginRight  = 80;
-static int g_marginTop    = 36;
-static int g_lineHeight   = 26;
+// Every screen is laid out for 1280x720; the vertices are scaled to the back buffer as they are
+// written (0.5625 x 0.667 at 720x480, which is right for its 16:9 pixels; 1.5 at 1080i).
+static const int g_screenWidth  = 1280;
+static const int g_screenHeight = 720;
+static const int g_marginLeft   = 80;
+static const int g_marginRight  = 80;
+static const int g_marginTop    = 36;
+static const int g_lineHeight   = 26;
+static float g_outScaleX = 1.0f;
+static float g_outScaleY = 1.0f;
 
 int Terminal_GetWidth(void)      { return g_screenWidth; }
 int Terminal_GetHeight(void)     { return g_screenHeight; }
@@ -19,97 +24,57 @@ int Terminal_GetLineHeight(void) { return g_lineHeight; }
 int Terminal_GetTopMargin(void)  { return g_marginTop; }
 int Terminal_GetLeftMargin(void) { return g_marginLeft; }
 
-static void update_font_and_layout(int width, int height)
+static void set_output_size(int width, int height)
 {
-    g_screenWidth  = width;
-    g_screenHeight = height;
+    g_outScaleX = (float)width / (float)g_screenWidth;
+    g_outScaleY = (float)height / (float)g_screenHeight;
+    D3DFont_SetOutputScale(g_outScaleX, g_outScaleY);
 
-    if (height <= 480) {
-        g_marginLeft  = (width >= 720) ? 40 : 36;
-        g_marginRight = (width >= 720) ? 40 : 36;
-        g_marginTop   = 28;
-        g_lineHeight  = 17;
-        D3DFont_SetScale(0.60f, 0.60f);
-    } else if (height <= 720) {
-        g_marginLeft  = 80;
-        g_marginRight = 80;
-        g_marginTop   = 36;
-        g_lineHeight  = 26;
-        D3DFont_SetScale(1.0f, 1.0f);
-    } else { // 1080i
-        g_marginLeft  = 120;
-        g_marginRight = 120;
-        g_marginTop   = 54;
-        g_lineHeight  = 35;
-        D3DFont_SetScale(1.42f, 1.42f);
-    }
-}
-
-bool Terminal_Init(void)
-{
-    D3DPRESENT_PARAMETERS pp;
-    Direct3D *pD3D;
     D3DVIEWPORT8 vp;
-    HRESULT hr;
-
-    pD3D = Direct3DCreate8(D3D_SDK_VERSION);
-    if (!pD3D) {
-        return false;
-    }
-
-    // Try native 720p (1280x720 progressive widescreen) first
-    ZeroMemory(&pp, sizeof(pp));
-    pp.BackBufferWidth = 1280;
-    pp.BackBufferHeight = 720;
-    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
-    pp.BackBufferCount = 1;
-    pp.Windowed = FALSE;
-    pp.EnableAutoDepthStencil = FALSE;
-    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    pp.FullScreen_RefreshRateInHz = 60;
-    pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
-    pp.Flags = D3DPRESENTFLAG_PROGRESSIVE | D3DPRESENTFLAG_WIDESCREEN;
-
-
-    hr = Direct3D_CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, NULL,
-                               D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &g_pDevice);
-
-    int initW = 1280, initH = 720;
-    if (FAILED(hr)) {
-        // Fallback to standard 640x480 if 720p is not enabled on the Xbox AV pack
-        ZeroMemory(&pp, sizeof(pp));
-        pp.BackBufferWidth = 640;
-        pp.BackBufferHeight = 480;
-        pp.BackBufferFormat = D3DFMT_X8R8G8B8;
-        pp.BackBufferCount = 1;
-        pp.Windowed = FALSE;
-        pp.EnableAutoDepthStencil = FALSE;
-        pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-        pp.FullScreen_RefreshRateInHz = 60;
-        pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
-
-        hr = Direct3D_CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, NULL,
-                                   D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &g_pDevice);
-        if (FAILED(hr)) {
-            return false;
-        }
-        initW = 640;
-        initH = 480;
-    }
-
     ZeroMemory(&vp, sizeof(vp));
-    vp.Width = pp.BackBufferWidth;
-    vp.Height = pp.BackBufferHeight;
+    vp.Width = (DWORD)width;
+    vp.Height = (DWORD)height;
     vp.MinZ = 0.0f;
     vp.MaxZ = 1.0f;
     D3DDevice_SetViewport(&vp);
+}
+
+static void fill_present_params(D3DPRESENT_PARAMETERS *pp, int width, int height, DWORD d3d_flags, UINT refreshRate)
+{
+    ZeroMemory(pp, sizeof(*pp));
+    pp->BackBufferWidth = width;
+    pp->BackBufferHeight = height;
+    pp->BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp->BackBufferCount = 1;
+    pp->Windowed = FALSE;
+    pp->EnableAutoDepthStencil = FALSE;
+    pp->SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp->FullScreen_RefreshRateInHz = (refreshRate > 0) ? refreshRate : 60;
+    pp->FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
+    pp->Flags = d3d_flags;
+}
+
+bool Terminal_Init(int width, int height, DWORD d3d_flags, UINT refreshRate)
+{
+    static Direct3D *pD3D;
+    if (!pD3D) {
+        pD3D = Direct3DCreate8(D3D_SDK_VERSION);
+        if (!pD3D) {
+            return false;
+        }
+    }
+
+    D3DPRESENT_PARAMETERS pp;
+    fill_present_params(&pp, width, height, d3d_flags, refreshRate);
+    if (FAILED(Direct3D_CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, NULL,
+                                     D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &g_pDevice))) {
+        g_pDevice = NULL;
+        return false;
+    }
+    set_output_size(width, height);
 
     // Initialize D3D textured quad font renderer (Arial proportional atlas)
-    bool fontOk = D3DFont_Init();
-
-    update_font_and_layout(initW, initH);
-
-    return fontOk;
+    return D3DFont_Init();
 }
 
 bool Terminal_SetVideoMode(int width, int height, DWORD d3d_flags, UINT refreshRate)
@@ -122,32 +87,11 @@ bool Terminal_SetVideoMode(int width, int height, DWORD d3d_flags, UINT refreshR
     D3DDevice_SetPixelShader(0);
 
     D3DPRESENT_PARAMETERS pp;
-    ZeroMemory(&pp, sizeof(pp));
-    pp.BackBufferWidth = width;
-    pp.BackBufferHeight = height;
-    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
-    pp.BackBufferCount = 1;
-    pp.Windowed = FALSE;
-    pp.EnableAutoDepthStencil = FALSE;
-    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    pp.FullScreen_RefreshRateInHz = (refreshRate > 0) ? refreshRate : 60;
-    pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
-    pp.Flags = d3d_flags;
-
-    HRESULT hr = D3DDevice_Reset(&pp);
-    if (FAILED(hr)) {
+    fill_present_params(&pp, width, height, d3d_flags, refreshRate);
+    if (FAILED(D3DDevice_Reset(&pp))) {
         return false;
     }
-
-    D3DVIEWPORT8 vp;
-    ZeroMemory(&vp, sizeof(vp));
-    vp.Width = pp.BackBufferWidth;
-    vp.Height = pp.BackBufferHeight;
-    vp.MinZ = 0.0f;
-    vp.MaxZ = 1.0f;
-    D3DDevice_SetViewport(&vp);
-
-    update_font_and_layout(width, height);
+    set_output_size(width, height);
 
     D3DDevice_BlockUntilVerticalBlank();
     return true;
@@ -221,115 +165,149 @@ static void clamp_and_render_text(int x, int y, DWORD color, WCHAR *wbuf, int le
     }
 }
 
-void Terminal_PrintAt(int x, int y, DWORD color, const char *fmt, ...)
+int Terminal_TextWidth(const char *text)
+{
+    WCHAR wbuf[256];
+    int len = 0;
+    while (text[len] && len < 255) {
+        wbuf[len] = (WCHAR)(unsigned char)text[len];
+        len++;
+    }
+    wbuf[len] = 0;
+    float w = 0.0f;
+    D3DFont_GetTextExtent(wbuf, len, &w, NULL);
+    return (int)w;
+}
+
+typedef enum { AL_LEFT, AL_RIGHT, AL_CENTER } align_t;
+
+static int row_y(int row) { return g_marginTop + row * g_lineHeight; }
+
+// Formats one line and draws it at y, placed by `align` inside [left, left + width).
+static void print_v(int y, int left, int width, align_t align, DWORD color, const char *fmt, va_list args)
 {
     char buf[512];
     WCHAR wbuf[512];
-    va_list args;
-
-    va_start(args, fmt);
     int len = format_string(buf, sizeof(buf), wbuf, sizeof(wbuf) / sizeof(WCHAR), fmt, args);
-    va_end(args);
-
+    if (len <= 0) return;
+    int x = left;
+    if (align != AL_LEFT) {
+        float w = 0.0f;
+        D3DFont_GetTextExtent(wbuf, len, &w, NULL);
+        x = (align == AL_RIGHT) ? left + width - (int)w : left + (width - (int)w) / 2;
+        if (x < g_marginLeft) x = g_marginLeft;
+    }
     clamp_and_render_text(x, y, color, wbuf, len);
+}
+
+void Terminal_PrintAt(int x, int y, DWORD color, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    print_v(y, x, 0, AL_LEFT, color, fmt, args);
+    va_end(args);
 }
 
 void Terminal_PrintRow(int row, DWORD color, const char *fmt, ...)
 {
     if (row < 0) return;
-    int y = g_marginTop + row * g_lineHeight;
+    va_list args;
+    va_start(args, fmt);
+    print_v(row_y(row), g_marginLeft, 0, AL_LEFT, color, fmt, args);
+    va_end(args);
+}
 
+// Cell for monospace rows: the widest glyph a hex dump prints. Wider characters in
+// the ASCII column are still centered on their cell and may touch their neighbors.
+static float mono_cell_width(void)
+{
+    static float cell = 0.0f;
+    if (cell <= 0.0f) {
+        static const WCHAR set[] = L"0123456789ABCDEFx:-";
+        for (int i = 0; set[i] != 0; i++) {
+            float a = D3DFont_GetGlyphAdvance(set[i]);
+            if (a > cell) cell = a;
+        }
+    }
+    return cell;
+}
+
+void Terminal_PrintRowMono(int row, DWORD color, const char *fmt, ...)
+{
+    if (row < 0) return;
     char buf[512];
     WCHAR wbuf[512];
     va_list args;
-
     va_start(args, fmt);
     int len = format_string(buf, sizeof(buf), wbuf, sizeof(wbuf) / sizeof(WCHAR), fmt, args);
     va_end(args);
+    if (len <= 0) return;
 
-    clamp_and_render_text(g_marginLeft, y, color, wbuf, len);
+    int y = row_y(row);
+    if (y < 0 || y + g_lineHeight > g_screenHeight) return;
+
+    float cell = mono_cell_width();
+    if (cell <= 0.0f) return;
+
+    // Truncate to the drawable width between the margins
+    int maxChars = (int)((float)(g_screenWidth - g_marginLeft - g_marginRight) / cell);
+    if (len > maxChars) {
+        len = maxChars;
+        wbuf[len] = 0;
+    }
+    if (len <= 0) return;
+
+    Terminal_FlushBatch();
+    D3DFont_DrawTextMono((float)g_marginLeft, (float)y, color, wbuf, len, cell);
 }
 
 void Terminal_PrintRowIndent(int row, int indentPx, DWORD color, const char *fmt, ...)
 {
     if (row < 0) return;
-    int y = g_marginTop + row * g_lineHeight;
-
-    char buf[512];
-    WCHAR wbuf[512];
     va_list args;
-
     va_start(args, fmt);
-    int len = format_string(buf, sizeof(buf), wbuf, sizeof(wbuf) / sizeof(WCHAR), fmt, args);
+    print_v(row_y(row), g_marginLeft + indentPx, 0, AL_LEFT, color, fmt, args);
     va_end(args);
-
-    clamp_and_render_text(g_marginLeft + indentPx, y, color, wbuf, len);
 }
 
 void Terminal_PrintRowRight(int row, DWORD color, const char *fmt, ...)
 {
     if (row < 0) return;
-    int y = g_marginTop + row * g_lineHeight;
-
-    char buf[512];
-    WCHAR wbuf[512];
     va_list args;
-
     va_start(args, fmt);
-    int len = format_string(buf, sizeof(buf), wbuf, sizeof(wbuf) / sizeof(WCHAR), fmt, args);
+    print_v(row_y(row), g_marginLeft, g_screenWidth - g_marginLeft - g_marginRight, AL_RIGHT, color, fmt, args);
     va_end(args);
-
-    float textWidth = 0.0f;
-    D3DFont_GetTextExtent(wbuf, len, &textWidth, NULL);
-
-    int x = g_screenWidth - g_marginRight - (int)textWidth;
-    if (x < g_marginLeft) x = g_marginLeft;
-
-    clamp_and_render_text(x, y, color, wbuf, len);
 }
 
 void Terminal_PrintRowCenter(int row, DWORD color, const char *fmt, ...)
 {
     if (row < 0) return;
-    int y = g_marginTop + row * g_lineHeight;
-
-    char buf[512];
-    WCHAR wbuf[512];
     va_list args;
-
     va_start(args, fmt);
-    int len = format_string(buf, sizeof(buf), wbuf, sizeof(wbuf) / sizeof(WCHAR), fmt, args);
+    print_v(row_y(row), 0, g_screenWidth, AL_CENTER, color, fmt, args);
     va_end(args);
-
-    float textWidth = 0.0f;
-    D3DFont_GetTextExtent(wbuf, len, &textWidth, NULL);
-
-    int x = (g_screenWidth - (int)textWidth) / 2;
-    if (x < g_marginLeft) x = g_marginLeft;
-
-    clamp_and_render_text(x, y, color, wbuf, len);
 }
 
 void Terminal_PrintRowCenterIn(int row, int leftIndentPx, int widthPx, DWORD color, const char *fmt, ...)
 {
     if (row < 0) return;
-    int y = g_marginTop + row * g_lineHeight;
-
-    char buf[512];
-    WCHAR wbuf[512];
     va_list args;
-
     va_start(args, fmt);
-    int len = format_string(buf, sizeof(buf), wbuf, sizeof(wbuf) / sizeof(WCHAR), fmt, args);
+    print_v(row_y(row), g_marginLeft + leftIndentPx, widthPx, AL_CENTER, color, fmt, args);
     va_end(args);
+}
 
-    float textWidth = 0.0f;
-    D3DFont_GetTextExtent(wbuf, len, &textWidth, NULL);
-
-    int x = g_marginLeft + leftIndentPx + (widthPx - (int)textWidth) / 2;
-    if (x < g_marginLeft) x = g_marginLeft;
-
-    clamp_and_render_text(x, y, color, wbuf, len);
+void Terminal_PrintItem(int row, bool selected, const char *fmt, ...)
+{
+    if (row < 0) return;
+    char body[480];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(body, sizeof(body), fmt, args);
+    va_end(args);
+    body[sizeof(body) - 1] = '\0';
+    Terminal_PrintRow(row, selected ? COLOR_PHOSPHOR_BRIGHT : COLOR_PHOSPHOR_NORMAL,
+                      "%s%s", selected ? "> " : "  ", body);
 }
 
 void Terminal_PrintCentered(DWORD color, const char *fmt, ...)
@@ -368,75 +346,70 @@ void Terminal_DrawHLine(int row, char ch, DWORD color)
     }
 }
 
-void Terminal_DrawHeader(const char *activeTabName, const char *fwVer)
+void Terminal_DrawHeader(const terminal_header_t *h)
 {
     // Double horizontal border
     Terminal_DrawHLine(0, '=', COLOR_PHOSPHOR_ACCENT);
 
-    // Title and right-aligned firmware version
-    const char *title = "X-HD SYSTEM CONFIGURATION TERMINAL";
+    // Title and right-aligned board state
+    const char *title = "X-HD REDUX SYSTEM CONFIGURATION TERMINAL";
     Terminal_PrintRow(1, COLOR_PHOSPHOR_BRIGHT, "%s", title);
 
     // Retro blinking phosphor block cursor at end of heading (~2 Hz)
     if ((GetTickCount() / 450) % 2 == 0) {
-        WCHAR wTitle[64];
-        int wLen = 0;
-        while (title[wLen] && wLen < 63) {
-            wTitle[wLen] = (WCHAR)(unsigned char)title[wLen];
-            wLen++;
-        }
-        wTitle[wLen] = 0;
-        float textW = D3DFont_GetTextWidth(wTitle, wLen);
-
-        float curX = (float)g_marginLeft + textW + 4.0f;
+        float curX = (float)g_marginLeft + (float)Terminal_TextWidth(title) + 4.0f;
         float curY = (float)(g_marginTop + 1 * g_lineHeight + 3);
-        float curW = (g_screenHeight <= 480) ? 7.0f : 10.0f;
-        float curH = (float)g_lineHeight - 6.0f;
-        Terminal_DrawFilledRect(curX, curY, curW, curH, COLOR_PHOSPHOR_BRIGHT);
+        Terminal_DrawFilledRect(curX, curY, 10.0f, (float)g_lineHeight - 6.0f, COLOR_PHOSPHOR_BRIGHT);
     }
 
-    if (fwVer && fwVer[0]) {
-        Terminal_PrintRowRight(1, COLOR_PHOSPHOR_NORMAL, "FW: v%s", fwVer);
+    const char *board = h->board_text ? h->board_text : "";
+    Terminal_PrintRowRight(1, h->board_color, "%s", board);
+    if (h->unsaved) {
+        // Just left of the board state.
+        static const char kUnsaved[] = "[UNSAVED CHANGES]";
+        int x = g_screenWidth - g_marginRight - Terminal_TextWidth(board) - 24 - Terminal_TextWidth(kUnsaved);
+        Terminal_PrintAt(x, row_y(1), COLOR_PHOSPHOR_AMBER, "%s", kUnsaved);
     }
 
     Terminal_DrawHLine(2, '=', COLOR_PHOSPHOR_ACCENT);
 
-    // Active Tab Navigation
-    Terminal_PrintRow(3, COLOR_PHOSPHOR_DIM, "Tabs: [WHITE / BLACK]   %s", activeTabName ? activeTabName : "MAIN");
+    // Tab strip: every tab by number, the active one bracketed with its name; how to move
+    // between them on the right.
+    int x = g_marginLeft;
+    const int gap = Terminal_TextWidth("   ");
+    for (int i = 0; i < h->tab_count && i < TERMINAL_MAX_TABS; i++) {
+        char item[48];
+        if (i == h->active_tab) {
+            snprintf(item, sizeof(item), "[%d %s]", i + 1, h->tab_names[i]);
+        } else {
+            snprintf(item, sizeof(item), "%d", i + 1);
+        }
+        Terminal_PrintAt(x, row_y(3), i == h->active_tab ? COLOR_PHOSPHOR_ACCENT : COLOR_PHOSPHOR_DIM, "%s", item);
+        x += Terminal_TextWidth(item) + gap;
+    }
+    Terminal_PrintRowRight(3, COLOR_PHOSPHOR_DIM, "Blk\\Wht");
 
     Terminal_DrawHLine(4, '-', COLOR_PHOSPHOR_DARK);
 }
 
-void Terminal_DrawFooter(const char *shortcuts, const char *shortcuts2, const char *statusMsg)
+static int footer_bottom_row(void) { return 23; }
+
+int Terminal_FooterTopRow(void)
 {
-    int bottomRow = (g_screenHeight <= 480) ? 24 : 23;
+    return footer_bottom_row() - 2;
+}
 
-    if (shortcuts2 && shortcuts2[0]) {
-        Terminal_DrawHLine(bottomRow - 3, '-', COLOR_PHOSPHOR_DARK);
+void Terminal_DrawFooter(const char *shortcuts, const char *statusMsg, bool alert)
+{
+    int bottomRow = footer_bottom_row();
 
-        if (statusMsg && statusMsg[0]) {
-            Terminal_PrintRow(bottomRow - 2, COLOR_PHOSPHOR_AMBER, "STATUS: %s", statusMsg);
-        } else {
-            Terminal_PrintRow(bottomRow - 2, COLOR_PHOSPHOR_DIM, "STATUS: Ready (SMBus @ 0xD2 Active)");
-        }
+    Terminal_DrawHLine(bottomRow - 2, '-', COLOR_PHOSPHOR_DARK);
 
-        if (shortcuts && shortcuts[0]) {
-            Terminal_PrintRow(bottomRow - 1, COLOR_PHOSPHOR_BRIGHT, "KEYS: %s", shortcuts);
-        }
-
-        Terminal_PrintRow(bottomRow, COLOR_PHOSPHOR_DIM, "    %s", shortcuts2);
-    } else {
-        Terminal_DrawHLine(bottomRow - 2, '-', COLOR_PHOSPHOR_DARK);
-
-        if (statusMsg && statusMsg[0]) {
-            Terminal_PrintRow(bottomRow - 1, COLOR_PHOSPHOR_AMBER, "STATUS: %s", statusMsg);
-        } else {
-            Terminal_PrintRow(bottomRow - 1, COLOR_PHOSPHOR_DIM, "STATUS: Ready (SMBus @ 0xD2 Active)");
-        }
-
-        if (shortcuts && shortcuts[0]) {
-            Terminal_PrintRow(bottomRow, COLOR_PHOSPHOR_BRIGHT, "KEYS: %s", shortcuts);
-        }
+    if (statusMsg && statusMsg[0]) {
+        Terminal_PrintRow(bottomRow - 1, alert ? COLOR_PHOSPHOR_AMBER : COLOR_PHOSPHOR_NORMAL, "%s", statusMsg);
+    }
+    if (shortcuts && shortcuts[0]) {
+        Terminal_PrintRow(bottomRow, COLOR_PHOSPHOR_BRIGHT, "KEYS: %s", shortcuts);
     }
 }
 
@@ -492,6 +465,8 @@ void Terminal_DrawLine(float x1, float y1, float x2, float y2, DWORD color)
     if (s_lineVertexCount + 2 > LINE_BATCH_SIZE) {
         Terminal_FlushBatch();
     }
+    x1 *= g_outScaleX; x2 *= g_outScaleX;
+    y1 *= g_outScaleY; y2 *= g_outScaleY;
     s_lineBatch[s_lineVertexCount + 0] = (D3D_VERTEX_2D){ x1, y1, 0.0f, 1.0f, color };
     s_lineBatch[s_lineVertexCount + 1] = (D3D_VERTEX_2D){ x2, y2, 0.0f, 1.0f, color };
     s_lineVertexCount += 2;
@@ -535,8 +510,10 @@ void Terminal_DrawFilledRect(float x, float y, float w, float h, DWORD color)
         Terminal_FlushBatch();
     }
 
-    float r = x + w;
-    float b = y + h;
+    float r = (x + w) * g_outScaleX;
+    float b = (y + h) * g_outScaleY;
+    x *= g_outScaleX;
+    y *= g_outScaleY;
 
     s_quadBatch[s_quadVertexCount + 0] = (D3D_VERTEX_2D){ x, b, 0.0f, 1.0f, color };
     s_quadBatch[s_quadVertexCount + 1] = (D3D_VERTEX_2D){ x, y, 0.0f, 1.0f, color };
@@ -547,12 +524,12 @@ void Terminal_DrawFilledRect(float x, float y, float w, float h, DWORD color)
 
 void Terminal_DrawAlignmentReticle(int pos_h, int pos_v)
 {
-    float cx = (float)g_screenWidth / 2.0f;  // Exactly 640.0f in 720p
-    float cy = (float)g_screenHeight / 2.0f; // Exactly 360.0f in 720p
+    float cx = (float)g_screenWidth / 2.0f;
+    float cy = (float)g_screenHeight / 2.0f;
     float sw = (float)g_screenWidth;
     float sh = (float)g_screenHeight;
 
-    // 1. Outer 720p Active Display Bounds (1280x720 100% raster edge) - double width
+    // 1. Outer active display bounds (100% raster edge) - double width
     Terminal_DrawRectThick(2.0f, 2.0f, sw - 4.0f, sh - 4.0f, COLOR_PHOSPHOR_DARK);
 
     // Corner brackets at screen perimeter (24px each) - double width
@@ -575,7 +552,7 @@ void Terminal_DrawAlignmentReticle(int pos_h, int pos_v)
     Terminal_DrawRectThick(safeH, safeV, sw - 2.0f * safeH, sh - 2.0f * safeV, COLOR_PHOSPHOR_DIM);
 
     // 3. Main Centering Reticle Box (Square alignment target)
-    float boxSize = (sh >= 720.0f) ? 220.0f : 140.0f;
+    float boxSize = 220.0f;
     float boxW = boxSize;
     float boxH = boxSize;
     float boxL = cx - boxW / 2.0f;
@@ -612,22 +589,12 @@ void Terminal_DrawAlignmentReticle(int pos_h, int pos_v)
         DWORD col = (t % 100 == 0) ? COLOR_PHOSPHOR_NORMAL : COLOR_PHOSPHOR_DIM;
         Terminal_DrawLine(cx - tickW / 2.0f, ty, cx + tickW / 2.0f, ty, col);
     }
-
-    // 6. Centered Legend Text directly ABOVE the center reticle box
-    int rCenter = (int)((boxT - (float)g_lineHeight - (float)g_marginTop + 4.0f) / (float)g_lineHeight);
-    if (rCenter < 5) rCenter = 5;
-
-    if (sh <= 480.0f) {
-        Terminal_PrintRowCenter(rCenter, COLOR_PHOSPHOR_NORMAL, "[ SCREEN CENTER : X=%d, Y=%d ]", (int)cx, (int)cy);
-    } else {
-        Terminal_PrintRowCenter(rCenter, COLOR_PHOSPHOR_NORMAL, "[ SCREEN CENTER : X=%d, Y=%d ]", (int)cx, (int)cy);
-    }
 }
 
-void UI_RunCRTCollapseAndExit(void)
+// The exit outro on its own; the caller then leaves (dashboard or console reboot).
+void UI_RunCRTCollapse(void)
 {
     if (!g_pDevice) {
-        XLaunchNewImage(NULL, NULL);
         return;
     }
 
@@ -719,6 +686,11 @@ void UI_RunCRTCollapseAndExit(void)
     // Phase 5: Final pure black frame
     Terminal_BeginFrame();
     Terminal_EndFrame();
+}
+
+void UI_RunCRTCollapseAndExit(void)
+{
+    UI_RunCRTCollapse();
 
     // Relaunch the Xbox default dashboard (stock or custom)
     XLaunchNewImage(NULL, NULL);

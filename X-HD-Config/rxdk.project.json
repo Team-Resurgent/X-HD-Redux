@@ -13,7 +13,18 @@
     "src/d3d_font.cpp",
     "src/font_asset.c",
     "src/xbox_eeprom.c",
-    "src/ui_black_level.c"
+    "src/eeprom_audio.c",
+    "src/ui_pattern.c",
+    "src/fw_flash.c",
+    "src/fw_update.c",
+    "src/ui_firmware.c",
+    "src/app_dir.c",
+    "src/ui_picklist.c",
+    "src/spd_presets.c",
+    "src/settings_names.c",
+    "src/edid_parse.c",
+    "src/eeprom_video.c",
+    "src/help_text.c"
   ],
   "defaultConfiguration": "Debug",
   "configurations": {

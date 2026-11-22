@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __BL_UART_UPDATE_H__
 #define __BL_UART_UPDATE_H__
 

@@ -12,6 +12,7 @@
 #include "../shared/adv7511_xbox.h"
 #include "../shared/debug.h"
 #include "../shared/xbox_video_standalone.h"
+#include "../shared/xbox_timing_rows.h"
 #include "../shared/vic_arbiter.h"
 #include "../shared/gpio.h"
 #include "../shared/defines.h"
@@ -41,6 +42,13 @@ static bool pending_bios_reapply = false;
 // re-pushed in place with no gate cycle). Reconnects / encoder re-probes / EDID retries
 // leave it clear -- those can change state (CSC, chip reset) the in-place path skips.
 static bool pending_bios_reapply_relock = false;
+static uint8_t pending_bios_reapply_applies;   // adv7511_apply_count() when latched
+static void latch_bios_reapply(bool relock) {
+    // In place only if no full reapply (reconnect, re-probe) is already latched.
+    pending_bios_reapply_relock = relock && !(pending_bios_reapply && !pending_bios_reapply_relock);
+    pending_bios_reapply = true;
+    pending_bios_reapply_applies = adv7511_apply_count();
+}
 
 // State for the non-blocking first-lock settle wait below.
 static bool pll_settling = false;
@@ -152,29 +160,9 @@ static void update_diagnostic_leds(bool pll_lock, bool bios_active, uint8_t sent
     // 3 blinks = 720p HD (VIC 4)
     // 4 blinks = 1080i HD (VIC 5)
     // (At most 4: five 100 ms blinks at standalone speed blur together.)
-    uint8_t blinks;
-    switch (sent_vic) {
-        case VIC_01_VGA_640x480_4_3:
-        case VIC_02_480p_60__4_3:
-        case VIC_03_480p_60_16_9:
-            blinks = 2; // 480p / VGA SD
-            break;
-        case VIC_04_720p_60_16_9:
-            blinks = 3; // 720p HD
-            break;
-        case VIC_05_1080i_60_16_9:
-            blinks = 4; // 1080i HD
-            break;
-        case VIC_17_576p_50__4_3:
-        case VIC_18_576p_50_16_9:
-        case VIC_21_576i_50_2xClk_4_3:
-        case VIC_22_576i_50_2xClk_16_9:
-            blinks = 1; // 576p / 576i PAL SD
-            break;
-        default:
-            blinks = 2;
-            break;
-    }
+    // (Any other VIC: 2.)
+    const uint8_t blinks = vic_is_hd(sent_vic) ? (sent_vic == VIC_05_1080i_60_16_9 ? 4 : 3)
+                         : (vic_is_576p(sent_vic) || vic_is_576i(sent_vic)) ? 1 : 2;
 
     // BIOS: 2.1 s cycle (4 blinks max x 400 ms + 500 ms pause). Standalone: the same pattern
     // at double speed.
@@ -306,6 +294,7 @@ static void supervise_hdmi(adv7511 *enc, xbox_encoder xb_encoder, uint8_t reg42,
                 // No edid_update_cache() here: adv7511_reinit_chip() fills the cache
                 // (through update_avi_infoframe() -> edid_is_hdmi_sink()), and a second
                 // fetch would cost another blocking EDID read on every boot.
+                const uint32_t setup_start = HAL_GetTick();
                 adv7511_reinit_chip(enc, xb_encoder);
                 smbus_note_chip_id(adv7511_read_register(0x00), adv7511_read_register(0xF5));
                 chip_configured = true;
@@ -313,7 +302,12 @@ static void supervise_hdmi(adv7511 *enc, xbox_encoder xb_encoder, uint8_t reg42,
                 // initial transition as a disconnect/reconnect/MSEN edge.
                 last_hpd = hpd;
                 last_msen = msen;
-                debug_log("[HDMI] HPD+MSEN ready\r\n");
+                // When both came up (ms since start) and how long the setup took: boots where
+                // this line came 1.4-1.6 s after the chip wait instead of ~150 ms couldn't say
+                // which of the two was slow.
+                debug_log(LOG_HDMI_READY,
+                          (unsigned long)hpd_msen_ready_since,
+                          (unsigned long)(HAL_GetTick() - setup_start));
             }
         } else {
             hpd_msen_ready_since = 0;
@@ -324,14 +318,15 @@ static void supervise_hdmi(adv7511 *enc, xbox_encoder xb_encoder, uint8_t reg42,
         // its 5 V rail) well before its receiver is ready (Programming Guide 4.2.1).
         // Recovery reapplies the mode through needs_reapply.
         if (hpd != last_hpd || msen != last_msen) {
-            debug_log("[HDMI] HPD: %s, MSEN: %s (0x42=0x%02X)\r\n",
+            debug_log(LOG_HDMI_HPD_MSEN,
                       hpd ? "CONNECTED" : "DISCONNECTED",
                       msen ? "ACTIVE" : "INACTIVE",
                       reg42);
             if (!hpd && last_hpd) {
-                // Cable disconnected: gate output and mute audio.
+                // Cable disconnected: gate output and mute audio. The chip resets on HPD low.
                 adv7511_disable_video();   // also mutes audio
-                debug_log("[HDMI] disconnected\r\n");
+                adv7511_note_hpd_reset();
+                debug_log(LOG_HDMI_DISCONNECTED);
             } else if ((hpd && !last_hpd) || (msen && !last_msen && hpd)) {
                 // Reconnected (HPD) or the sink became ready (MSEN). An HPD-low episode
                 // resets the AVI InfoFrame, CSC and packet enables, and the sink may be a
@@ -339,6 +334,9 @@ static void supervise_hdmi(adv7511 *enc, xbox_encoder xb_encoder, uint8_t reg42,
                 // mode fully. Power up first: any HPD-low, even one too brief to sample,
                 // puts the chip in Main Power Down, where every write is ignored.
                 adv7511_ensure_powered_up();
+                // Powered up from the reset, audio sample packets are on (0x44's power-on
+                // 0x79) under a closed gate and downed TMDS: off, until output is back.
+                adv7511_mute_audio();
                 if (xb_encoder != ENCODER_UNKNOWN) {
                     adv7511_enable_video();
                     adv7511_unmute_audio();
@@ -348,9 +346,12 @@ static void supervise_hdmi(adv7511 *enc, xbox_encoder xb_encoder, uint8_t reg42,
                 edid_update_cache();
                 // Resend the SPD InfoFrame (packet memory was reset; no-op on DVI).
                 adv7511_init_spd_infoframe();
+                // The TV is on (many keep HPD up in standby and only drop MSEN), so an
+                // earlier <Standby> from it is stale.
+                adv7511_cec_tv_standby_clear();
                 *needs_reapply = true;
-                debug_log("[HDMI] %s\r\n", (hpd && !last_hpd) ? "Reconnected"
-                                                               : "Monitor Sense active -- reasserting");
+                // 1 "Reconnected" (HPD came back), 0 "Monitor Sense active -- reasserting".
+                debug_log(LOG_HDMI_BACK, (unsigned)(hpd && !last_hpd));
             }
             last_hpd = hpd;
             last_msen = msen;
@@ -374,16 +375,16 @@ static void supervise_encoder_probe(void)
             smbus_disarm_encoder_probe();
             s_probe_disarmed = true;
             if (already_known) {
-                debug_log("[ENCODER PROBE] resolved\r\n");
+                debug_log(LOG_ENCODER_PROBE_RESOLVED);
             } else {
-                debug_log("[ENCODER PROBE] %s cap, unknown\r\n",
+                debug_log(LOG_ENCODER_PROBE_UNKNOWN,
                           smbus_host_addressed_us() ? "45s" : "180s");
             }
         }
     }
 }
 
-static void follow_encoder_format(xbox_encoder xb_encoder)
+static void follow_encoder_format(void)
 {
     // The encoder's input format (Conexant IN_MODE, Focus 0x92) is tracked all boot: a BIOS
     // or dashboard can switch it YCrCb -> RGB mid-boot, and a chainload can switch it back.
@@ -392,11 +393,11 @@ static void follow_encoder_format(xbox_encoder xb_encoder)
     if (smbus_encfmt_take_dirty()) {
         bool in_rgb = false;
         xbox_encoder_input_is_rgb(&in_rgb, NULL);
-        debug_log("[ENCFMT] encoder input -> %s\r\n", in_rgb ? "RGB" : "YCrCb");
+        debug_log(LOG_ENCFMT, in_rgb ? "RGB" : "YCrCb");
         uint8_t ucs = user_config_get()->color_space;
         if ((ucs == COLOR_SPACE_AUTO || ucs == COLOR_SPACE_AUTO_SD_RGB_FULL) &&
             adv7511_any_mode_applied()) {
-            reapply_active_mode(xb_encoder);
+            request_reapply();
         }
     }
 }
@@ -422,7 +423,7 @@ static void poll_recovery_jumper(void)
         // __aeabi_idivmod/__divsi3 (~470 B).
         if (++rec_idx >= 3) rec_idx = 0;
         smbus_force_encoder(enc_addr[rec_idx]);
-        debug_log("[RECOVERY] encoder cycle -> %s\r\n", get_xbox_encoder_name(enc_addr[rec_idx]));
+        debug_log(LOG_RECOVERY_ENCODER, get_xbox_encoder_name(enc_addr[rec_idx]));
     }
 }
 
@@ -451,17 +452,22 @@ static void publish_status(bool hpd, bool msen, bool pll_lock, bool bios_active,
 }
 
 // Act on needs_reapply (reconnect, encoder correction) and the latched BIOS reapply.
-static void handle_reapply(adv7511 *enc, xbox_encoder xb_encoder, bool needs_reapply, bool pll_lock,
+static void handle_reapply(adv7511 *enc, xbox_encoder xb_encoder, bool needs_reapply, bool pll_lock, bool hpd,
                            uint8_t line_vic, uint8_t sent_vic, uint32_t pclk_hz)
 {
     bool needs_reapply_started_cycle = false;
     if (needs_reapply) {
-        // Reconnects and encoder corrections reapply through the same paths as a relock.
-        if (adv7511_active_mode_is_bios()) {
+        // Reconnects and encoder corrections reapply through the same paths as a relock. BIOS
+        // only with its packet still there: a freeze drops it, and the latched re-apply then
+        // had nothing to put back, leaving no picture while standalone's handoff waited.
+        // Standalone re-pushes the mode on the chip instead.
+        if (adv7511_active_mode_is_bios() && getSMBusSettings()->mode != 0) {
             // Latch the request instead of acting on it directly -- see
-            // pending_bios_reapply's declaration.
-            pending_bios_reapply = true;
-            pending_bios_reapply_relock = false;
+            // pending_bios_reapply's declaration. The reconnect is a mode change of its own
+            // for standalone too (the chip re-measures the clock) -- noted first, so the latch
+            // can't go out on this pass's stale "settled".
+            stand_alone_note_signal_loss();
+            latch_bios_reapply(false);
         } else {
             // force_reapply: the arbiter still decides (a reconnect onto a changed signal
             // gets the right mode at once), and "no change" re-pushes the current mode to
@@ -476,7 +482,17 @@ static void handle_reapply(adv7511 *enc, xbox_encoder xb_encoder, bool needs_rea
     // The latched BIOS reapply, retried every pass until the cycle is free -- and not during
     // the settle wait, whose polls need an undisturbed clock and detector. It is the only way
     // back to a picture after a relock with a quiet dashboard (no new packet to reconcile).
-    if (pending_bios_reapply && !adv7511_tmds_cycle_busy() && !pll_settling) {
+    // Not while HPD is low: a reconnect latched it and HPD fell again before the cycle freed,
+    // and the apply went into the chip's Main Power Down. The next reconnect latches it anew.
+    // A re-push like standalone's: it waits out a mode change and its verdict grace, and an
+    // apply since (the new mode set's packet) takes its place. Without that, a relock during a
+    // switch to 1080i re-applied the last packet's 720x480 onto the 1080i raster just ahead of
+    // 1080i's own apply.
+    if (pending_bios_reapply && adv7511_apply_count() != pending_bios_reapply_applies) {
+        pending_bios_reapply = pending_bios_reapply_relock = false;
+    }
+    if (pending_bios_reapply && hpd && !adv7511_tmds_cycle_busy() && !pll_settling &&
+        stand_alone_change_settled()) {
         pending_bios_reapply = false;
         if (pending_bios_reapply_relock) {
             adv7511_tmds_cycle_begin_deferred();
@@ -502,7 +518,7 @@ static void handle_reapply(adv7511 *enc, xbox_encoder xb_encoder, bool needs_rea
     }
 }
 
-static void supervise_pll(adv7511 *enc, xbox_encoder xb_encoder, bool pll_lock, uint32_t pclk_hz)
+static void supervise_pll(adv7511 *enc, xbox_encoder xb_encoder, bool pll_lock, bool hpd, uint32_t pclk_hz)
 {
     // PLL relock and clock settle watchdog.
     //
@@ -524,7 +540,7 @@ static void supervise_pll(adv7511 *enc, xbox_encoder xb_encoder, bool pll_lock, 
         }
         if (!last_pll_locked) {
             last_pll_locked = true;
-            debug_log("[PLL EVENT] GPU Pixel Clock LOCKED\r\n");
+            debug_log(LOG_PLL_LOCKED);
 
             // The TMDS drivers stay down (they went down on the loss): the settle wait and
             // usually a reapply cycle follow, and the cycle powers them up -- powering up
@@ -548,15 +564,17 @@ static void supervise_pll(adv7511 *enc, xbox_encoder xb_encoder, bool pll_lock, 
             // (0x44[5]) stay muted until the output is back.
             adv7511_update_register(0x0B, 0b10000000, 0b10000000);
 
+            // The settle wait below keeps stand_alone_loop() from running, so nothing it would
+            // judge counts settled meanwhile -- the first lock of a boot too: its power-on
+            // "settled" let the wire-VIC service step the first mode's VIC up in the next mode
+            // set's burst.
+            stand_alone_note_signal_loss();
+
             // The outputs went down on the loss. A BIOS mode needs a reapply (latched, like a
             // reconnect) -- a relock with no new packet otherwise left the output dead.
             // Standalone recovers through the settle wait below.
             if (adv7511_active_mode_is_bios()) {
-                // In place only if no full reapply (reconnect, re-probe) is already latched.
-                if (!pending_bios_reapply) {
-                    pending_bios_reapply_relock = true;
-                }
-                pending_bios_reapply = true;
+                latch_bios_reapply(true);
             }
 
             // Kick off the non-blocking settle wait below; the first poll happens
@@ -620,7 +638,7 @@ static void supervise_pll(adv7511 *enc, xbox_encoder xb_encoder, bool pll_lock, 
                 // The loss muted audio and left the drivers down; a reapply cycle restores
                 // both, and if none runs (same mode, or in place) the catch-all does.
             }
-        } else {
+        } else if (hpd) {
             // The standalone pass, every iteration (BIOS packets apply below). Fresh reads:
             // a gate cycle earlier this pass can have disturbed 0x3E.
             uint8_t fresh_hw_vic = adv7511_read_register(0x3E) >> 2;
@@ -629,29 +647,41 @@ static void supervise_pll(adv7511 *enc, xbox_encoder xb_encoder, bool pll_lock, 
         }
 
         // Apply a pending BIOS packet (the arbiter's L1 decides when it owns the picture).
-        bios_reconcile_pending_target(xb_encoder);
+        // Neither this nor the standalone pass while HPD is low: the chip is in Main Power
+        // Down and drops every write, and the arbiter, reading the reset chip as "nothing
+        // applied", re-applied every pass. The packet waits; the reconnect re-applies.
+        if (hpd) {
+            bios_reconcile_pending_target(xb_encoder);
+        }
     } else if (last_pll_locked && adv7511_any_mode_applied()) {
         // Hardware Reset on GPU Clock Drop / Reboot / Resolution Switch. Not before the first
         // real mode: the PLL can drop lock briefly ~20-90 ms after first acquiring it, and
         // nothing is on screen yet.
         last_pll_locked = false;
         smbus_telemetry_event(XHD_TLM_EV_PLL_LOSS);
+        // A mode change for standalone: nothing re-pushes until the clock is back and settled
+        // (a relock re-applied the last packet's 720x480 onto a 1080i mode set's raster). A
+        // queued settings re-apply goes too: the next picture's apply takes the settings.
+        stand_alone_note_signal_loss();
+        cancel_reapply();
 
         // Re-measure the clock's settle from scratch on the next acquisition.
         adv7511_pixel_clock_reset_stability();
 
-        // 1. Cut TMDS line drivers immediately to prevent TV receiver jitter
+        // 1. Hardware Audio Mute to prevent boot/mode pops -- first: audio packets on with the
+        //    drivers down breaks the chip's audio rule (the SMC's clamp usually got there first,
+        //    not on a pulled plug).
+        adv7511_mute_audio();
+
+        // 2. Cut TMDS line drivers immediately to prevent TV receiver jitter
         // (the next relock decides when they come back up).
         adv7511_power_down_tmds();
         tmds_power_up_pending = false;
 
-        // 2. Hardware Audio Mute to prevent boot/mode pops
-        adv7511_mute_audio();
-
         // 3. Clear transient hardware interrupt flags
         adv7511_write_register(0x96, 0xFF);
 
-        debug_log("[PLL EVENT] GPU Pixel Clock LOST (9E=%02X)\r\n",
+        debug_log(LOG_PLL_LOST,
                   adv7511_read_register(0x9E));
     }
 }
@@ -662,6 +692,25 @@ void video_supervisor_step(adv7511 *enc, xbox_encoder *xb_encoder_io, bool *enco
     bool encoder_mismatch = *encoder_mismatch_io;
 
     debug_ring_flush();
+
+    // No mode tables this boot (xbox_timing_tables_missing(): mid HD+ -> X-HD conversion, the
+    // HD+ bootloader still in pages 0-19): hands-off. The previous firmware's chip
+    // configuration is live and showing a picture; one write of ours could end it, and without
+    // the tables nothing could bring it back. So nothing below runs -- no reinit, no CEC, no
+    // mute, no settings writes; reads would be harmless but there is nothing to read for.
+    // What does run is what the conversion needs: the WRITE_RAM_APPLY drain writing the new
+    // bootloader, the probe disarm (ISR latency during those page writes), and the CLI. Both
+    // LEDs blink fast in unison -- no other state uses that pattern. The conversion ends in an
+    // SMC power cycle (XHDUpdater and the config XBE both), and the next boot finds the tables.
+    if (xbox_timing_tables_missing()) {
+        bool phase = ((HAL_GetTick() / 100) % 2) == 0;
+        set_led_1(phase);
+        set_led_2(phase);
+        supervise_encoder_probe();
+        smbus_consume_flash_write();
+        debug_cli_poll(xb_encoder);
+        return;
+    }
 
     uint8_t reg9e = adv7511_read_register(0x9E);
     bool raw_pll_lock = (reg9e >> 4) & 0x01;
@@ -698,11 +747,11 @@ void video_supervisor_step(adv7511 *enc, xbox_encoder *xb_encoder_io, bool *enco
         } else if (adv7511_any_mode_applied()) {
             needs_reapply = true;
         }
-        debug_log("[EDID] retry ok\r\n");
+        debug_log(LOG_EDID_RETRY_OK);
     }
 
     supervise_encoder_probe();
-    follow_encoder_format(xb_encoder);
+    follow_encoder_format();
     // The console clamps its analog audio as a reboot/shutdown starts; HDMI audio isn't on
     // that clamp, so mute it here, for 1 s -- long enough for the audio buffer to run out.
     // A plain mute, not the SMBus hold: a mode apply unmutes as usual. Some BIOSes clamp
@@ -713,7 +762,7 @@ void video_supervisor_step(adv7511 *enc, xbox_encoder *xb_encoder_io, bool *enco
     if (smc_ev & SMC_EV_AUDIO_CLAMP) {
         adv7511_mute_audio();
         s_clamp_muted_at = HAL_GetTick() | 1u;
-        debug_log("[AUDIO] SMC clamp: muted\r\n");
+        debug_log(LOG_AUDIO_SMC_CLAMP_MUTED);
     } else if (s_clamp_muted_at && (HAL_GetTick() - s_clamp_muted_at) >= 1000u) {
         s_clamp_muted_at = 0;
         if (pll_lock && hpd && xb_encoder != ENCODER_UNKNOWN && !adv7511_tmds_cycle_busy() &&
@@ -721,9 +770,10 @@ void video_supervisor_step(adv7511 *enc, xbox_encoder *xb_encoder_io, bool *enco
             adv7511_unmute_audio();
         }
     }
-    // The console is shutting down (not rebooting): put the TV in standby too.
-    if ((smc_ev & SMC_EV_SHUTDOWN) && !user_config_get()->cec_standby_off) {
-        adv7511_cec_standby();
+    // The console is shutting down (not rebooting): put the TV back (or in standby).
+    // cec_standby_off: 0 = restore, 1 = do nothing, 2 = always <Standby>.
+    if ((smc_ev & SMC_EV_SHUTDOWN) && user_config_get()->cec_standby_off != 1) {
+        adv7511_cec_standby(user_config_get()->cec_standby_off == 2);
     }
     poll_recovery_jumper();
 
@@ -747,11 +797,9 @@ void video_supervisor_step(adv7511 *enc, xbox_encoder *xb_encoder_io, bool *enco
     // the INT edge with another interrupt would be lost.
     cec_clock_out_follow_config();
     adv7511_cec_poll();
-    // One Touch Play (page-63, on by default), once per boot from power-on,
-    // HPD or not -- see adv7511_cec_one_touch_step(); it waits for the EDID itself.
-    if (!user_config_get()->cec_one_touch_off) {
-        adv7511_cec_one_touch_step(edid_cec_physical_address());
-    }
+    // The CEC address claim, every boot, and One Touch Play (page-63, on by default), from
+    // power-on, HPD or not -- see adv7511_cec_claim_step(); it waits for the EDID itself.
+    adv7511_cec_claim_step(edid_cec_physical_address(), !user_config_get()->cec_one_touch_off);
 
     // Services the interrupt flag (clears/re-enables on 0x96).
     adv_handle_interrupts(enc);
@@ -760,7 +808,12 @@ void video_supervisor_step(adv7511 *enc, xbox_encoder *xb_encoder_io, bool *enco
     // iteration, unconditionally, before the busy-checks below.
     adv7511_tmds_cycle_service();
 
-    handle_reapply(enc, xb_encoder, needs_reapply, pll_lock, line_vic, sent_vic, pclk_hz);
+    // SMBus control-suite writes (141-145, 152-154) the ISR or the UART bridge stashed:
+    // register, flash and reapply work happens here, outside the ISR -- ahead of the pass's
+    // reconnect re-push, so it takes the new settings. After it (in bios_loop()), a defaults
+    // reset landing 1 ms before a reconnect went out old-aspect, then reapplied.
+    smbus_consume_settings_changes(xb_encoder);
+    handle_reapply(enc, xb_encoder, needs_reapply, pll_lock, hpd, line_vic, sent_vic, pclk_hz);
 
     // SMBus BIOS packets, every pass. bios_loop() only records the packet;
     // bios_reconcile_pending_target() (in supervise_pll()) applies it. Note the pending flag
@@ -772,12 +825,15 @@ void video_supervisor_step(adv7511 *enc, xbox_encoder *xb_encoder_io, bool *enco
         stand_alone_cancel_queued(enc);
     }
 
-    supervise_pll(enc, xb_encoder, pll_lock, pclk_hz);
+    supervise_pll(enc, xb_encoder, pll_lock, hpd, pclk_hz);
+    // After the pass's mode decisions: one they just applied already took the setting.
+    service_reapply(xb_encoder);
 
     // Wire VIC follows the settled clock (see adv7511_wire_vic_service()) -- not while a
-    // decided mode change is still queued (standalone's width wait): its apply re-judges it.
+    // decided mode change is still queued: its apply re-judges it.
     if (!(enc->vic & ADV7511_VIC_CHANGED)) {
         adv7511_wire_vic_service();
+        adv7511_picture_profile_service();
     }
 
     // Catch-all for tmds_power_up_pending (see its declaration): once the relock has
@@ -791,8 +847,6 @@ void video_supervisor_step(adv7511 *enc, xbox_encoder *xb_encoder_io, bool *enco
             adv7511_tmds_resume_output();
         }
     }
-
-    smbus_poll_sniffer();
 
     debug_cli_poll(xb_encoder);
 

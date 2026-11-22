@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 // VIC autodetect/arbitration: the single VIC decision function. See vic_arbiter.h.
 // Pure: no HAL/I2C/statics.
 //
@@ -23,9 +24,15 @@ static bool arb_signal_looks_sub57hz(uint32_t pclk_hz) {
 //    blind fallback.
 //  - ARB_REGION_NTSC: a 525-line 60 Hz raster -- NTSC-M/J, PAL-M, and a PAL-I console set to
 //    60 Hz (EEPROM keeps the PAL-I standard but sets the 60 Hz bit).
-//  - ARB_REGION_UNKNOWN: no EEPROM standard and no PAL/HD evidence yet.
-// See arb_region() for the evidence order.
+//  - ARB_REGION_UNKNOWN: no EEPROM standard captured.
+// arb_region() reads it from the EEPROM.
 typedef enum { ARB_REGION_UNKNOWN = 0, ARB_REGION_NTSC, ARB_REGION_PAL50 } arb_region_t;
+
+// Line counts, as the line-count evidence in arb_assess() narrows them: 480 (640 and 720
+// wide alike -- the detector can't tell them apart), 576, HD. A family's bit; none for FAM_NONE.
+#define ARB_LINES_480 1u
+#define ARB_LINES_576 2u
+#define ARB_LINES_HD  4u
 
 // Defined further down; arb_blind_fallback_vic() needs them first.
 static void arb_resolve_aspect(mode_family_t fam, const arb_snapshot_t *in, int bios_ws,
@@ -140,12 +147,14 @@ static uint8_t arb_pal50_sd_vic_debounced(const arb_snapshot_t *in, arb_state_t 
         st->pal50_sd_since = in->now_ms;
         return VIC_00_VIC_Unavailable;
     }
-    if (raw == VIC_00_VIC_Unavailable) return VIC_00_VIC_Unavailable;
     if ((in->now_ms - st->pal50_sd_since) < ARB_PAL50_SD_HOLD_MS) return VIC_00_VIC_Unavailable;
     return raw;
 }
 
 // L6's SD guess while the detector is blind, strongest evidence first:
+//  0. the line-count evidence (arb_assess()) leaves only 576 lines -> 576, whatever the region:
+//     it is measured (Xcalibur's mode index, Conexant's narrow-576 clocks, Focus narrow at
+//     27.000 MHz), and a missed EEPROM capture put a Focus 640x576 out as VIC 1.
 //  1. width confirmed narrow, not PAL50 -> a real 640-wide NTSC signal: VIC 1.
 //  2. width confirmed wide -> 720x480, or 720x576 when the PAL50 clock says 576. The sticky
 //     width verdict beats the clock here: this often runs while a previous apply has just
@@ -155,10 +164,10 @@ static uint8_t arb_pal50_sd_vic_debounced(const arb_snapshot_t *in, arb_state_t 
 //  4. a 50 Hz signal (region not NTSC and the rate estimate says < 57 Hz, or the PAL50 clock
 //     says narrow 576i) -> 576: VIC 21/22 if narrow, else VIC 17/18.
 //  5. otherwise VIC 1.
-// On a known-NTSC console this never returns a 576 VIC. *widescreen / *anamorphic come from
-// arb_resolve_aspect(), so the caller can pass them straight to arb_pick().
+// On a known-NTSC console only the measured case (0) returns a 576 VIC. *widescreen /
+// *anamorphic come from arb_resolve_aspect(), so the caller can pass them straight to arb_pick().
 static __attribute__((noinline)) uint8_t arb_blind_fallback_vic(const arb_snapshot_t *in, arb_region_t region,
-                                      bool *widescreen, bool *anamorphic) {
+                                      uint8_t lines, bool *widescreen, bool *anamorphic) {
     *widescreen = false;
     *anamorphic = false;
     // The raw PAL50 verdict, not the debounced one: the debounce resets on every TMDS cycle,
@@ -166,34 +175,35 @@ static __attribute__((noinline)) uint8_t arb_blind_fallback_vic(const arb_snapsh
     // function of clock and width; the blind_fb latch in decide_target_vic() absorbs
     // transients.
     uint8_t pal50_raw = arb_pal50_sd_vic(in);
+    const bool only_576 = (lines & (uint8_t)~ARB_LINES_HD) == ARB_LINES_576;
     // Not on PAL50: there "confirmed narrow" can't tell a PAL 640x576 (Conexant 0x05) from an
     // NTSC 640x480, so PAL50-narrow falls through to the 50 Hz branch below. The shared tail
     // resolves the aspect the same way the apply path does (4:3, or anamorphic 16:9), so the
     // arbiter and the apply agree and L6 doesn't reapply VIC 1 every loop.
-    if (in->width_confirmed && !in->width_wide && region != ARB_REGION_PAL50) {
+    if (in->width_confirmed && !in->width_wide && region != ARB_REGION_PAL50 && !only_576) {
         goto narrow_640;
     }
     if (in->width_confirmed && in->width_wide) {
         // 576 only on the PAL50 clock's 576 side. A Conexant clock at/above its 576p floor is
         // 576 even mid-cycle, when pclk_stable (and so pal50_raw) is briefly false.
-        bool is_576 = region == ARB_REGION_PAL50 &&
+        bool is_576 = only_576 || (region == ARB_REGION_PAL50 &&
             (pal50_raw == VIC_18_576p_50_16_9 ||
-             (in->encoder_id == ENCODER_CONEXANT && in->pclk_hz >= ARB_CONEXANT_PAL576_PCLK_MIN_HZ));
+             (in->encoder_id == ENCODER_CONEXANT && in->pclk_hz >= ARB_CONEXANT_PAL576_PCLK_MIN_HZ)));
         mode_family_t fam = is_576 ? FAM_SD_720x576 : FAM_SD_720x480;
         bool ana;
         arb_resolve_aspect(fam, in, -1, widescreen, &ana);
         return arb_vic_for(fam, *widescreen);
     }
     bool narrow = in->width_confirmed && !in->width_wide;
-    if (narrow && pal50_raw == VIC_01_VGA_640x480_4_3) {
+    if (narrow && pal50_raw == VIC_01_VGA_640x480_4_3 && !only_576) {
         goto narrow_640;
     }
-    // The rate check runs on PAL50 too: pal_ever_seen keeps the region PAL50 all boot, and a
+    // The rate check runs on PAL50 too: the EEPROM region is PAL50 all boot, and a
     // PAL console's own 60 Hz modes (24.4/27.4 MHz) must not be forced onto 50 Hz timings.
     // The PAL50 clock's narrow-576i verdict is OR'd in because Conexant's narrow-576 clocks
     // (24.625, 27.125 MHz) sit between narrow-480 ones (24.420/24.937, 26.874/27.562 MHz) --
     // a single rate cutoff can't express that.
-    bool is_50hz = (region != ARB_REGION_NTSC && arb_signal_looks_sub57hz(in->pclk_hz)) ||
+    bool is_50hz = only_576 || (region != ARB_REGION_NTSC && arb_signal_looks_sub57hz(in->pclk_hz)) ||
                    (narrow && pal50_raw == VIC_21_576i_50_2xClk_4_3);
     if (is_50hz) {
         // Best guess 576-line; the aspect still comes from a real source (WSS/EEPROM/user).
@@ -226,6 +236,16 @@ static uint8_t arb_vic_for(mode_family_t fam, bool widescreen) {
     }
 }
 
+// A hold timer: the first call starts it (*since = now) and never fires; later calls fire once
+// `ms` have passed. *since == 0 means "not started" -- the callers clear it to re-arm.
+static bool held_for(uint32_t *since, uint32_t now, uint32_t ms) {
+    if (*since == 0) {
+        *since = now;
+        return false;
+    }
+    return now - *since >= ms;
+}
+
 static mode_family_t arb_family_of_vic(uint8_t vic) {
     switch (vic) {
         case VIC_01_VGA_640x480_4_3:                              return FAM_SD_640;
@@ -238,55 +258,14 @@ static mode_family_t arb_family_of_vic(uint8_t vic) {
     }
 }
 
-// Every PAL-table mode_index (576p50 and the five hybrid/placeholder rows).
-static bool arb_mode_idx_is_pal(uint8_t idx) {
-    return (xbox_mode_flags(idx, 0) & MODE_PAL50) != 0;
-}
-
-// Latch hd_ever_seen / pal_ever_seen from this snapshot (both sticky for the boot).
-static void arb_note_hd(const arb_snapshot_t *in, arb_state_t *st) {
-    // HD: a BIOS mode (confirmed or pending) in an HD family counts on its own; a live HD VIC
-    // only with a stable HD-range clock behind it -- a ~20 MHz 480-line/50 Hz hybrid can
-    // transiently misread 0x3E as 720p, and that must not latch NTSC onto a PAL signal.
-    if (!st->hd_ever_seen) {
-        bool bios_hd =
-            (in->confirmed_mode_index != 0xFF && mode_family_is_hd(xbox_mode_family(in->confirmed_mode_index, in->encoder_id))) ||
-            (in->pending_mode_index != 0xFF && mode_family_is_hd(xbox_mode_family(in->pending_mode_index, in->encoder_id)));
-        bool clock_is_hd = in->pclk_stable && in->pclk_hz >= ARB_HD_PCLK_MIN_HZ;
-        bool live_hd = clock_is_hd && (mode_family_is_hd(arb_family_of_vic(in->hw_vic)) ||
-                                       mode_family_is_hd(arb_family_of_vic(in->active_vic)));
-        if (bios_hd || live_hd) st->hd_ever_seen = true;
-    }
-    // PAL evidence, latched even after HD has been seen: a PAL console with HD enabled also
-    // outputs 720p/1080i, but an NTSC console never produces a 576-line raster. Live readings
-    // need a stable SD-range clock, so an HD clock or a detector glitch can't latch it.
-    const bool sd_clock = in->pclk_stable && in->pclk_hz > 0 && in->pclk_hz < ARB_HD_PCLK_MIN_HZ;
-    // Focus: the detector can read the 576 family on its NTSC SDTV-family 480-line raster, so
-    // a 576 reading in that clock band is not PAL evidence.
-    const bool focus_sdtv_band = in->encoder_id == ENCODER_FOCUS &&
-                                 in->pclk_hz >= ARB_FOCUS_SDTV_PCLK_MIN_HZ;
-    if (!st->pal_ever_seen &&
-        ((in->confirmed_mode_index != 0xFF && arb_mode_idx_is_pal(in->confirmed_mode_index)) ||
-         (in->pending_mode_index != 0xFF && arb_mode_idx_is_pal(in->pending_mode_index)) ||
-         (sd_clock && !focus_sdtv_band && arb_family_of_vic(in->hw_vic) == FAM_SD_720x576) ||
-         (sd_clock && in->encoder_id == ENCODER_CONEXANT &&
-          in->pclk_hz >= ARB_CONEXANT_PAL576_PCLK_MIN_HZ))) {
-        st->pal_ever_seen = true;
-    }
-}
-
-// Evidence order: the console's EEPROM VideoStandard, then PAL evidence, then HD. HD is the
-// weakest -- a PAL console with HD enabled outputs 720p/1080i too -- so it only decides NTSC
-// when nothing says PAL.
-static arb_region_t arb_region(const arb_snapshot_t *in, const arb_state_t *st) {
+// The console's EEPROM VideoStandard, or UNKNOWN when it wasn't captured (it is only broadcast
+// at console boot, so a board-only reset loses it; a console reboot recaptures it).
+static arb_region_t arb_region(const arb_snapshot_t *in) {
     if (in->eeprom_std_valid) {
         // A PAL-I console set to 60 Hz runs NTSC-shaped 525-line rasters: NTSC here.
         return (in->eeprom_std_is_pal && !in->eeprom_refresh_60hz)
                    ? ARB_REGION_PAL50 : ARB_REGION_NTSC;
     }
-    // No EEPROM capture (it is only broadcast at console boot, so a board-only reset loses it).
-    if (st->pal_ever_seen) return ARB_REGION_PAL50;
-    if (st->hd_ever_seen) return ARB_REGION_NTSC;
     return ARB_REGION_UNKNOWN;
 }
 
@@ -333,17 +312,6 @@ static void arb_resolve_aspect(mode_family_t fam, const arb_snapshot_t *in, int 
     *widescreen = want_wide && !*anamorphic;
 }
 
-// Is the live signal consistent with this pending BIOS mode yet? HD needs the matching
-// detector VIC; SD needs an SD clock when blind, or just no HD detector reading.
-static bool arb_pending_plausible(mode_family_t fam, uint8_t vic, const arb_snapshot_t *in, bool blind) {
-    if (fam == FAM_HD_720p)  return in->hw_vic == VIC_04_720p_60_16_9;
-    if (fam == FAM_HD_1080i) return in->hw_vic == VIC_05_1080i_60_16_9;
-    if (arb_vic_is_sd(vic))
-        return blind ? (in->pclk_hz >= ARB_SD_PCLK_MIN_HZ && in->pclk_hz <= ARB_SD_PCLK_MAX_HZ)
-                     : !vic_is_hd(in->hw_vic);
-    return false;
-}
-
 static vic_decision_t arb_hold(void) {
     vic_decision_t d = {0};
     d.source = ARB_SRC_HOLD;
@@ -363,6 +331,11 @@ static vic_decision_t arb_pick(arb_source_t src, uint8_t vic, bool ws, bool ana,
     d.apply = (vic != in->active_vic) ||
               (vic == VIC_01_VGA_640x480_4_3 && ana != in->active_is_anamorphic);
     return d;
+}
+
+static uint8_t arb_lines_of(mode_family_t f) {
+    return f == FAM_SD_640 || f == FAM_SD_720x480 ? ARB_LINES_480 : f == FAM_SD_720x576 ? ARB_LINES_576 :
+           mode_family_is_hd(f) ? ARB_LINES_HD : 0;
 }
 
 // The narrow-576 pick: VIC 21/22, the placeholder pair the console itself uses for its
@@ -387,6 +360,7 @@ static void arb_clear_blind_fallback(arb_state_t *st) {
     st->blind_fb_vic = 0;
     st->blind_fb_ws = false;
     st->blind_fb_ana = false;
+    st->blind_fb_aspect = ARB_ASPECT_AUTO;
     st->blind_fb_cand_vic = 0;
     st->blind_fb_cand_ws = false;
     st->blind_fb_cand_ana = false;
@@ -402,12 +376,15 @@ typedef struct {
     bool         blind;               // detector reads VIC 0
     bool         effective_blind;     // blind, or a reading that can't be trusted
     bool         hw_reading_current;  // the reading describes the current raster
-    bool         hw_hd_on_sd_clock;   // an HD reading on a confirmed SD clock (lingering)
     bool         sd_clock_confirmed;  // a settled SD-range clock
     arb_region_t region;
     uint8_t      pal50_dbnc;          // debounced PAL50 verdict (VIC 0 = none)
-    bool         cx_576_narrow;       // a Conexant narrow-576 clock
+    bool         narrow_576;          // 640x576 known: a Conexant narrow-576 clock, Xcalibur's mode index, Focus narrow 27 MHz
     bool         hw_narrow_576;       // a 576 reading on confirmed-narrow content
+    uint8_t      lines;               // ARB_LINES_* the raster can be (line-count evidence)
+    uint8_t      bios_lines;          // the same for L1 staleness (2): without a width or index
+                                      // from before the console's latest packet
+    bool         hw_ruled_out;        // the reading's family is outside `lines`
 } arb_ctx_t;
 
 // A level's decision: store it and report "decided".
@@ -446,19 +423,19 @@ static void arb_assess(const arb_snapshot_t *in, arb_state_t *st, arb_ctx_t *c) 
                             ? (in->pclk_hz - st->hw_vic_lock_pclk)
                             : (st->hw_vic_lock_pclk - in->pclk_hz);
             if (drift > ARB_HW_DRIFT_HZ) {
-                if (st->hw_vic_drift_since == 0) st->hw_vic_drift_since = in->now_ms;
-                else if ((in->now_ms - st->hw_vic_drift_since) >= ARB_HW_DRIFT_HOLD_MS)
+                if (held_for(&st->hw_vic_drift_since, in->now_ms, ARB_HW_DRIFT_HOLD_MS))
                     hw_stale = true;
             } else {
                 st->hw_vic_drift_since = 0;
             }
         }
+    } else if (in->pclk_hz == 0) {
+        // Blind with no clock at all: nothing up to hold a reading of, so the next one is a
+        // fresh acquisition -- re-baseline it. A wrong 17 at 22.68 MHz otherwise made the
+        // real 17 on the next mode's 27.000 MHz 576 raster "drift", and L5 put 720x480 out
+        // ahead of it (seen on Focus). A reading held through the gap is not blind.
+        st->hw_vic_locked = VIC_00_VIC_Unavailable;
     }
-    // Focus: a 576-family reading in the SDTV-family clock band contradicts itself -- that
-    // band is interlaced 480-line content. L6 resolves it from Focus's width signal.
-    const bool hw_sdtv_mismatch = in->encoder_id == ENCODER_FOCUS &&
-        in->pclk_hz >= ARB_FOCUS_SDTV_PCLK_MIN_HZ &&
-        arb_family_of_vic(in->hw_vic) == FAM_SD_720x576;
 
     // All encoders: the detector reads line timing, so a narrow mode on a 720x480-shaped
     // raster still reads VIC 2. When the encoder's own width signal is confirmed and
@@ -481,41 +458,80 @@ static void arb_assess(const arb_snapshot_t *in, arb_state_t *st, arb_ctx_t *c) 
     // A stale 576 reading from 0x12 otherwise forced VIC 21 on the next mode (0x01).
     const uint8_t xm = xbox_mode_flags(in->xcal_mode_index, ENCODER_XCALIBUR);
     const bool xcal_576_narrow = (xm & MODE_FAM_MASK) == FAM_SD_720x576 && (xm & MODE_640);
+    // Focus at its 576 clock (27.000 MHz): narrow is only ever 640x576 (0x05/0x12), and the
+    // SDTV path only ever 576 lines (0x05/0x06/0x12) -- its 480p modes share the clock but are
+    // 720-wide on the progressive path, and its narrow 480-line ones run 22.68 (PAL-60) or
+    // 29.455 MHz (NTSC). Measured, so it holds without the EEPROM region too, and for PAL
+    // modes on an NTSC console (0x06 went out 720x480).
+    const bool focus_576_clock = in->encoder_id == ENCODER_FOCUS &&
+        in->pclk_hz >= ARB_PAL50_576P_PCLK_MIN_HZ && in->pclk_hz <= ARB_PAL50_SD_PCLK_HIGH_HZ;
+    const bool focus_576_narrow = focus_576_clock && in->width_confirmed && !in->width_wide &&
+        !in->width_stale_held;
     const bool hw_narrow_576 =
         in->width_confirmed && !in->width_wide && arb_family_of_vic(in->hw_vic) == FAM_SD_720x576 &&
         ((in->encoder_id != ENCODER_CONEXANT && in->encoder_id != ENCODER_XCALIBUR) ||
          cx_576_narrow || xcal_576_narrow);
 
-    // Conexant: 576-line content exists only at the two narrow-576 clocks or at/above the
-    // 576p floor. A 576-family reading at any other clock is a stale detector, not a raster.
-    bool cx_576_valid = cx_576_narrow || (in->pclk_hz >= ARB_CONEXANT_PAL576_PCLK_MIN_HZ);
-    const bool cx_hw_576_mismatch = in->encoder_id == ENCODER_CONEXANT && in->pclk_hz > 0 &&
-        arb_family_of_vic(in->hw_vic) == FAM_SD_720x576 && !cx_576_valid;
+    // --- Line-count evidence: the families the raster can be, from all but the detector ---
+    // Each fact narrows the set; a reading outside it is stale, ahead of its raster or misread,
+    // and counts as blind (L3/L4/L6) and as no evidence of a mode change (L1 staleness (1)):
+    //  - a settled HD clock is HD (no SD mode runs above ~29.5 MHz: a stale VIC 2 on a frozen
+    //    boot into 720p put 720x480 out for good on Focus); a settled SD clock is SD
+    //    (the detector lingers on HD ~2 s after 720p -> 640x480 on Xcalibur);
+    //  - Xcalibur's register mode index names the line count (1080i went out 25 ms into the
+    //    next mode set's burst; a stale 17 on NTSC 480p went out as 720x576);
+    //  - an NTSC console never outputs 576 lines (the reading only, below), and none runs above
+    //    ARB_PAL50_SD_PCLK_HIGH_HZ (measured SD bursts run 24.6-27.7 MHz; a stray 17 on Focus
+    //    PAL-60 0x02 at 29.455 MHz went out as 720x576, and released the BIOS 16:9);
+    //  - Conexant runs 576 lines only at its two narrow-576 clocks and in its 576p band, and
+    //    only 576 there: ~1 in 3 settled 576 readings is VIC 2, and wide content in the band
+    //    went out as VIC 3 ahead of L4's VIC 18;
+    //  - Focus/Xcalibur in the Path A window ([22.5, 23.95) MHz): the PAL-I 480-line hybrid
+    //    (576p50 runs ~27 MHz, 576i50 ~13.5 MHz);
+    //  - Focus at its 576 clock, narrow or on the SDTV path: 576 (see focus_576_clock).
+    uint8_t lines = ARB_LINES_480 | ARB_LINES_576 | ARB_LINES_HD;
+    uint8_t width_lines = lines;   // the facts from the width signal / Xcalibur index
+    if (in->pclk_stable && in->pclk_hz > 0) {
+        lines &= in->pclk_hz >= ARB_HD_PCLK_MIN_HZ ? ARB_LINES_HD : (uint8_t)~ARB_LINES_HD;
+    }
+    if ((xm & MODE_FAM_MASK) != FAM_NONE) width_lines &= arb_lines_of((mode_family_t)(xm & MODE_FAM_MASK));
+    if (in->pclk_hz > ARB_PAL50_SD_PCLK_HIGH_HZ ||
+        ((in->encoder_id == ENCODER_FOCUS || in->encoder_id == ENCODER_XCALIBUR) &&
+         in->pclk_hz >= ARB_PATH_A_PCLK_LOW_HZ && in->pclk_hz < ARB_PATH_A_PCLK_HIGH_HZ)) {
+        lines &= (uint8_t)~ARB_LINES_576;
+    }
+    if (focus_576_narrow) width_lines &= ARB_LINES_576;
+    if (focus_576_clock && in->focus_sdtv) lines &= ARB_LINES_576;
+    if (in->encoder_id == ENCODER_CONEXANT && in->pclk_hz > 0 && in->pclk_hz <= ARB_PAL50_SD_PCLK_HIGH_HZ) {
+        lines &= (cx_576_narrow || in->pclk_hz >= ARB_CONEXANT_PAL576_PCLK_MIN_HZ)
+               ? ARB_LINES_576 : (uint8_t)~ARB_LINES_576;
+    }
+    // A width or index from before the console's latest packet describes the mode set before
+    // it (one whose writes the sniffer missed): it can't rule the packet's own mode out -- it
+    // replaced a correct BIOS 0x07 with 640x576 on Focus, 0x05 with 640x480 on Xcalibur. The
+    // arbiter's own levels still use it.
+    const uint8_t bios_lines = in->width_predates_bios ? lines : (uint8_t)(lines & width_lines);
+    lines &= width_lines;
+    // The EEPROM standard judges the reading only: the HD test app puts PAL modes out on an
+    // NTSC console too, so the BIOS packet's own mode stays possible (L1 staleness (2) dropped
+    // a forced 0x05's 640x576 for VIC 1 on Conexant).
+    const uint8_t hw_lines = (in->eeprom_std_valid && !in->eeprom_std_is_pal) ? (uint8_t)(lines & ~ARB_LINES_576) : lines;
+    const bool hw_ruled_out = (arb_lines_of(arb_family_of_vic(in->hw_vic)) & ~hw_lines) != 0;
 
-    // Focus/Xcalibur: a clock in the Path A window ([22.5, 23.95) MHz) is the PAL-I 480-line
-    // hybrid; 576p50 runs ~27 MHz and 576i50 ~13.5 MHz. A 576-family reading there is a
-    // stale detector carried across a mode change (seen on Xcalibur PAL).
-    const bool hw_pal_hybrid_mismatch = (in->encoder_id == ENCODER_FOCUS || in->encoder_id == ENCODER_XCALIBUR) &&
-        in->pclk_hz >= ARB_PATH_A_PCLK_LOW_HZ && in->pclk_hz < ARB_PATH_A_PCLK_HIGH_HZ &&
-        arb_family_of_vic(in->hw_vic) == FAM_SD_720x576;
-
-    // L3/L4/L6 treat an untrusted reading exactly like a blind one. (L1's staleness check and
-    // Path A's window test use `blind`.)
-    const bool effective_blind = blind || hw_stale || hw_sdtv_mismatch || hw_width_mismatch ||
-        hw_pal_hybrid_mismatch || cx_hw_576_mismatch;
+    // And a reading in no family at all (Conexant's 625-line rasters read VIC 29/30/37/38, the
+    // pixel-repeated 576p codes): no level acted on it, so an Aspect change waited for the
+    // detector to go blind (a 16:9 -> 4:3 change came 0.4 s late on Conexant PAL), and a
+    // frozen boot on it applied nothing at all.
+    const bool effective_blind = blind || hw_stale || hw_width_mismatch || hw_ruled_out ||
+        arb_family_of_vic(in->hw_vic) == FAM_NONE;
 
     // A settled SD-range clock outranks a flapping detector: on a rock-steady ~21 MHz
-    // 480-line/50 Hz hybrid, 0x3E cycles 720p <-> blind <-> 480p about every second. An HD
-    // reading on a < 40 MHz clock is physically impossible.
+    // 480-line/50 Hz hybrid, 0x3E cycles 720p <-> blind <-> 480p about every second.
     const bool sd_clock_confirmed = in->pclk_stable && in->pclk_hz > 0 &&
                                     in->pclk_hz < ARB_HD_PCLK_MIN_HZ;
-    // An HD reading on a confirmed SD clock: the detector lingering on the previous HD raster
-    // (~2 s after 720p -> 640x480 on Xcalibur). L1 and L4 ignore it.
-    const bool hw_hd_on_sd_clock = sd_clock_confirmed && vic_is_hd(in->hw_vic);
 
     // Region, resolved once. NTSC makes Path A (L3) and every PAL fallback unreachable.
-    arb_note_hd(in, st);
-    const arb_region_t region = arb_region(in, st);
+    const arb_region_t region = arb_region(in);
 
     // The debounced PAL50 verdict (see arb_pal50_sd_vic_debounced()), used by L4 and L6.
     // Computed while the region is still UNKNOWN too: a PAL clock here can be the first PAL
@@ -548,57 +564,51 @@ static void arb_assess(const arb_snapshot_t *in, arb_state_t *st, arb_ctx_t *c) 
                                    : (st->hw_fam_lock_pclk - in->pclk_hz);
     const bool hw_reading_current = st->hw_fam_lock_pclk != 0 && hw_lock_drift <= ARB_HW_DRIFT_HZ;
 
+    if (!effective_blind && vic_is_hd(in->hw_vic)) {
+        st->hd_det_vic = in->hw_vic;
+        st->hd_det_enc = in->enc_hd_vic;
+    }
     c->blind = blind;
     c->effective_blind = effective_blind;
     c->hw_reading_current = hw_reading_current;
-    c->hw_hd_on_sd_clock = hw_hd_on_sd_clock;
     c->sd_clock_confirmed = sd_clock_confirmed;
     c->region = region;
     c->pal50_dbnc = pal50_dbnc;
-    c->cx_576_narrow = cx_576_narrow;
+    // Focus's too: L5 put a stale VIC 2's 480 lines on 640x576 (0x05) for ~560 ms before L6 got
+    // there, and without the EEPROM region a VIC 1 first.
+    c->narrow_576 = cx_576_narrow || xcal_576_narrow || focus_576_narrow;
     c->hw_narrow_576 = hw_narrow_576;
+    c->lines = lines;
+    c->bios_lines = bios_lines;
+    c->hw_ruled_out = hw_ruled_out;
 }
 
-// Level 1 (and 2): a BIOS mode, confirmed or pending.
+// Level 1: the confirmed BIOS mode.
 static bool arb_level_bios(const arb_snapshot_t *in, arb_state_t *st, const arb_ctx_t *c,
                     vic_decision_t *out) {
     // ================= Level 1: BIOS =================
-    // A pending packet (one the reconcile is applying) beats the confirmed mode: until it
-    // lands, bios_confirmed still names the old mode. Order:
-    //  a) a pending mode the signal already fits (BIOS-authoritative rows always) -> it owns;
-    //  b) else the confirmed mode, unless stale (below);
-    //  c) else, with only an unconfirmable pending mode, BIOS_WAIT (bounded), then standalone.
+    // A packet still being applied needs nothing here: its burst holds the mode-change state
+    // open, which rolls back every standalone apply until the new mode is confirmed.
     uint8_t bidx = 0xFF;
-    bool pend = in->bios_pending && in->pending_mode_index != 0xFF;
-    if (pend) {
-        mode_family_t pf = xbox_mode_family(in->pending_mode_index, in->encoder_id);
-        uint8_t pvic = arb_vic_for(pf, false);
-        if (pf != FAM_NONE &&
-            (arb_is_bios_authoritative(in->pending_mode_index) ||
-             arb_pending_plausible(pf, pvic, in, c->blind))) {
-            bidx = in->pending_mode_index;                    // (a)
-            st->bios_stale_since = 0;   // a fresh packet supersedes any staleness
-        }
-    }
-    if (bidx == 0xFF && !in->bios_confirmed) {
+    if (!in->bios_confirmed) {
         st->bios_stale_since = 0;
     }
-    if (bidx == 0xFF && in->bios_confirmed && in->confirmed_mode_index != 0xFF) {
+    if (in->bios_confirmed && in->confirmed_mode_index != 0xFF) {
         // A confirmed mode stays authoritative between packets unless the live signal has
         // moved to another family with SMBus silent -- e.g. a 720p BIOS screen handed to a
         // 640 standalone context, which otherwise pinned VIC 4 ("Unsupported" on the TV).
         // Never for BIOS-authoritative rows; needs a settled clock and ARB_BIOS_STALE_MS so
         // a mid-switch misread can't hand off. Stale if:
-        //  (1) the detector reads a different family on the current raster (not an HD
-        //      reading on an SD clock -- see hw_hd_on_sd_clock);
-        //  (2) the mode is HD but the clock is far below any HD rate (a 640 signal the
-        //      detector reads as blind);
-        //  (3) the mode is 576 but the clock is in the Path A window -- the PAL-I 480-line
-        //      hybrid under a stale 576 confirm (mirrors L3);
-        //  (4) the debounced width signal contradicts the mode's 480-line width. (1) can't
+        //  (1) the detector reads a different family on the current raster -- one the line-count
+        //      evidence doesn't rule out (see arb_assess(): an HD reading on an SD clock, a
+        //      non-576 one at a Conexant narrow-576 clock, a stray 17 on Focus PAL-60 0x02 at
+        //      29.455 MHz that released the BIOS 16:9 VIC 3 to L6's 4:3);
+        //  (2) the line-count evidence rules the mode's own line count out: an HD mode on an
+        //      SD clock (a 640 signal the detector reads as blind), a 576 mode in the Path A
+        //      window (the PAL-I 480-line hybrid under a stale 576 confirm, mirrors L3);
+        //  (3) the debounced width signal contradicts the mode's 480-line width. (1) can't
         //      see 640 <-> 720 because arb_family_agrees() merges those families.
         mode_family_t cf = xbox_mode_family(in->confirmed_mode_index, in->encoder_id);
-        bool cf_is_hd = mode_family_is_hd(cf);
         bool cf_is_sd_720 = (cf == FAM_SD_720x480);
         bool cf_is_sd_640 = (cf == FAM_SD_640);
         // Not a width held over from earlier content (width_stale_held: Focus's width went
@@ -606,19 +616,17 @@ static bool arb_level_bios(const arb_snapshot_t *in, arb_state_t *st, const arb_
         // content dropped confirmed 0x0F to L6 every time. (0x0F is excluded from staleness
         // altogether, as BIOS-authoritative: even a fresh width reading is wrong for it.)
         bool width_contradicts_bios = in->width_confirmed && !in->width_stale_held &&
+            !in->width_predates_bios &&
             ((cf_is_sd_720 && !in->width_wide) || (cf_is_sd_640 && in->width_wide));
         bool stale = !arb_is_bios_authoritative(in->confirmed_mode_index) && in->pclk_stable &&
-                     ((!c->blind && c->hw_reading_current && !c->hw_hd_on_sd_clock &&
+                     ((!c->blind && !c->hw_ruled_out && c->hw_reading_current &&
                        arb_family_of_vic(in->hw_vic) != FAM_NONE &&
                        !arb_family_agrees(in->hw_vic, arb_vic_for(cf, false))) ||
-                      (cf_is_hd && in->pclk_hz > 0 && in->pclk_hz < ARB_HD_PCLK_MIN_HZ) ||
-                      (cf == FAM_SD_720x576 &&
-                       in->pclk_hz >= ARB_PATH_A_PCLK_LOW_HZ &&
-                       in->pclk_hz < ARB_PATH_A_PCLK_HIGH_HZ) ||
+                      (arb_lines_of(cf) & ~c->bios_lines) ||
                       width_contradicts_bios);
         if (!stale) {
             st->bios_stale_since = 0;
-            bidx = in->confirmed_mode_index;                   // (b)
+            bidx = in->confirmed_mode_index;
         } else if (st->bios_stale_since == 0) {
             st->bios_stale_since = in->now_ms;
             bidx = in->confirmed_mode_index;                   // hold until debounced
@@ -634,7 +642,6 @@ static bool arb_level_bios(const arb_snapshot_t *in, arb_state_t *st, const arb_
             // The packet's widescreen bit is the BIOS aspect hint. (0x02/0x06/0x08/0x11
             // are 720-wide in either aspect, so width says nothing about aspect.)
             arb_resolve_aspect(fam, in, in->bios_widescreen ? 1 : 0, &ws, &ana);
-            st->bios_pending_since = 0;
             // 0x05/0x12 are the 640x576 rows: family 720x576 for the checks above, but
             // the apply uses VIC 21/22, not 17/18. Only the logged/telemetry VIC sees this
             // -- an ARB_SRC_BIOS decision is never applied by standalone.
@@ -644,15 +651,6 @@ static bool arb_level_bios(const arb_snapshot_t *in, arb_state_t *st, const arb_
                 : arb_vic_for(fam, ws);
             return arb_done(out, arb_pick(ARB_SRC_BIOS, target_vic, ws, ana, in));
         }
-    }
-    if (pend) {                                                // (c)
-        if (st->bios_pending_since == 0) st->bios_pending_since = in->now_ms;
-        if ((in->now_ms - st->bios_pending_since) < ARB_BIOS_WAIT_MS) {
-            vic_decision_t d = arb_hold();
-            d.source = ARB_SRC_BIOS_WAIT;
-            return arb_done(out, d);
-        }
-        // timed out -> fall through
     }
     return false;
 }
@@ -700,16 +698,14 @@ static bool arb_level_path_a(const arb_snapshot_t *in, arb_state_t *st, const ar
             st->path_a_since = 0;
             st->path_a_latched = false;
         } else if (st->path_a_latched && active_is_path_a_leavable) {
-            if (in->active_vic == pa_expected_vic) return arb_done(out, arb_hold());
             return arb_done(out, arb_pick(ARB_SRC_PATH_A, pa_expected_vic, pa_ws, pa_ana, in));
         } else if (path_a_hw_ok && active_is_path_a_leavable && !in->tmds_cycle_busy &&
                    in->pclk_hz > 0) {
-            if (st->path_a_since == 0) st->path_a_since = in->now_ms;
-            if ((in->now_ms - st->path_a_since) >= ARB_PATH_A_HOLD_MS) {
+            if (held_for(&st->path_a_since, in->now_ms, ARB_PATH_A_HOLD_MS)) {
                 st->path_a_latched = true;
-                if (in->active_vic == pa_expected_vic) return arb_done(out, arb_hold());
                 return arb_done(out, arb_pick(ARB_SRC_PATH_A, pa_expected_vic, pa_ws, pa_ana, in));
             }
+            st->verdict_pending = true;
         } else if (!path_a_hw_ok) {
             st->path_a_since = 0;
         }
@@ -730,12 +726,15 @@ static bool arb_level_hw_vic(const arb_snapshot_t *in, arb_state_t *st, const ar
     // HPD reconnect) holds too; a forced re-push restores the mode. HD readings are exempt.
     if (!c->blind && !c->hw_reading_current && st->hw_fam_lock_pclk != 0 &&
         !in->pclk_stable && !in->first_lock && arb_vic_is_sd(in->hw_vic)) {
+        st->verdict_pending = true;
         return arb_done(out, arb_hold());
     }
-    if (!c->effective_blind && arb_family_of_vic(in->hw_vic) != FAM_NONE && !c->hw_hd_on_sd_clock) {
+    if (!c->effective_blind) {
         // Narrow 576 (see hw_narrow_576): straight to the VIC 21/22 placeholder, ahead of the
         // agreement logic below, which can't express "576 lines, but narrow". arb_pick() is a
-        // no-op if VIC 21/22 is already active.
+        // no-op if VIC 21/22 is already active. A width left from the previous mode can't get
+        // out: the mode-change state (xbox_video_standalone.c) rolls back every apply until
+        // the clock settles.
         if (c->hw_narrow_576) {
             return arb_done(out, arb_pick_576i(ARB_SRC_HW_VIC, in));
         }
@@ -753,7 +752,6 @@ static bool arb_level_hw_vic(const arb_snapshot_t *in, arb_state_t *st, const ar
             fam = arb_family_of_vic(c->pal50_dbnc);
             pal50_override = true;
         }
-
         // First lock: active_vic is whatever init left, not a real mode, so adopt the family
         // at once, without the debounce. Needs a clock: 0x3E re-acquires faster than the ACR,
         // and a reading with pclk still 0 can be wrong (one wrong-VIC frame); pclk 0 takes the
@@ -803,11 +801,11 @@ static bool arb_level_hw_vic(const arb_snapshot_t *in, arb_state_t *st, const ar
         if (agree) {
             st->hw_incompat_since = 0;
         } else {
-            if (st->hw_incompat_since == 0) st->hw_incompat_since = in->now_ms;
-            else if ((in->now_ms - st->hw_incompat_since) >= ARB_HW_DEBOUNCE_MS) {
+            if (held_for(&st->hw_incompat_since, in->now_ms, ARB_HW_DEBOUNCE_MS)) {
                 st->hw_incompat_since = 0;
                 return arb_done(out, arb_pick_family(ARB_SRC_HW_VIC, resolve_fam, in));
             }
+            st->verdict_pending = true;
         }
     } else {
         st->hw_incompat_since = 0;
@@ -823,32 +821,37 @@ static bool arb_level_width(const arb_snapshot_t *in, arb_state_t *st, const arb
     // The width signal tells 640 from 720 geometry, not aspect, so this compares geometry to
     // geometry (VIC 2 and 3 are both 720-wide) and the target takes the resolved aspect --
     // targeting VIC 3 under a user 4:3 setting re-applied forever.
-    // VIC 3 is watched only above the Path A window on Xcalibur/Conexant, so this doesn't
-    // fight L3 there. Focus has no Path A and a reliable width signal in that band, so it
-    // always watches -- otherwise a Focus VIC 3 whose raster narrowed to 640 at ~22.68 MHz
-    // had no way back to VIC 1.
+    // VIC 3 is watched only outside the Path A window on Xcalibur/Conexant, so this doesn't
+    // fight L3 there. Below it nothing else did: a user 16:9 VIC 3 held on Xcalibur PAL
+    // 640x480 (0x03, 20.8 MHz) for good. Focus has no Path A and a reliable width
+    // signal in that band, so it always watches -- otherwise a Focus VIC 3 whose raster
+    // narrowed to 640 at ~22.68 MHz had no way back to VIC 1.
     const bool watch = (in->active_vic == VIC_01_VGA_640x480_4_3 ||
                         in->active_vic == VIC_02_480p_60__4_3 ||
                         (in->active_vic == VIC_03_480p_60_16_9 &&
                          (in->encoder_id == ENCODER_FOCUS ||
+                          in->pclk_hz < ARB_PATH_A_PCLK_LOW_HZ ||
                           in->pclk_hz >= ARB_PATH_A_PCLK_HIGH_HZ)));
-    // Not at Conexant's narrow-576 clocks: this level only knows the 480-line families,
-    // and would demote such content to VIC 1 (wrong family). L6 handles it.
+    // Not on known 640x576 (Conexant's narrow-576 clocks, Xcalibur's mode index): this level
+    // only knows the 480-line families, and would demote such content to VIC 1 (wrong
+    // family) -- Xcalibur 0x10 -> 0x05 put out 640x480 before L6 got to VIC 22. L6 handles it.
     if (watch && in->pclk_stable && in->width_confirmed &&
-        in->pclk_hz > 0 && in->pclk_hz < ARB_HD_PCLK_MIN_HZ && !c->cx_576_narrow) {
+        in->pclk_hz > 0 && in->pclk_hz < ARB_HD_PCLK_MIN_HZ && !c->narrow_576) {
         // 720-wide raster = FAM_SD_720x480 (VIC 2 AND VIC 3); 640 = FAM_SD_640.
         const bool active_geom_wide =
             arb_family_of_vic(in->active_vic) == FAM_SD_720x480;
         if (in->width_wide != active_geom_wide) {
-            if (st->width_mismatch_since == 0) st->width_mismatch_since = in->now_ms;
-            else if ((in->now_ms - st->width_mismatch_since) >= ARB_WIDTH_HOLD_MS) {
+            if (held_for(&st->width_mismatch_since, in->now_ms, ARB_WIDTH_HOLD_MS)) {
                 st->width_mismatch_since = 0;
                 // The family must match the target width: going to 640 needs FAM_SD_640
                 // so a 16:9 want becomes anamorphic (FAM_SD_720x480 here once turned a
-                // correct 640 anamorphic picture into plain 4:3).
-                return arb_done(out, arb_pick_family(ARB_SRC_WIDTH,
-                                       in->width_wide ? FAM_SD_720x480 : FAM_SD_640, in));
+                // correct 640 anamorphic picture into plain 4:3). Wide where only 576 lines run
+                // is 720x576 (Conexant's 576p band: VIC 3 went out ahead of L4's VIC 18, seeds
+                // 2654, 2703).
+                return arb_done(out, arb_pick_family(ARB_SRC_WIDTH, !in->width_wide ? FAM_SD_640 :
+                                       c->lines == ARB_LINES_576 ? FAM_SD_720x576 : FAM_SD_720x480, in));
             }
+            st->verdict_pending = true;
         } else {
             st->width_mismatch_since = 0;
         }
@@ -860,20 +863,25 @@ static bool arb_level_width(const arb_snapshot_t *in, arb_state_t *st, const arb
 }
 
 // Level 5b: the width signal against an applied narrow-576 VIC.
-static bool arb_level_width_576(const arb_snapshot_t *in, arb_state_t *st, const arb_ctx_t *c,
-                    vic_decision_t *out) {
+static bool arb_level_width_576(const arb_snapshot_t *in, const arb_ctx_t *c, vic_decision_t *out) {
     // ============= Level 5b: Width re-check (SD 576-line narrow<->wide) =============
     // The 576 counterpart, one direction only: hw_narrow_576 (L4) already moves a stuck VIC
     // 17/18 to 21/22 whenever the width reads narrow. Nothing moved back: VIC 21/22 and a
     // 576-family reading "agree" on family, so confirmed-wide content held on VIC 21 (seen on
     // Conexant 0x06). No debounce of its own -- width_wide is already debounced upstream.
-    if (in->width_confirmed && in->width_wide &&
-        vic_is_576i(in->active_vic)) {
-        // Conexant: a wide 480-line raster (0x04/0x10, ~27.56 MHz) can also land on VIC 21/22
-        // through hw_narrow_576's family-only match; below the 576p floor it is 480-line.
-        if (in->encoder_id == ENCODER_CONEXANT && in->pclk_hz < ARB_CONEXANT_PAL576_PCLK_MIN_HZ) {
-            return arb_done(out, arb_pick_family(ARB_SRC_WIDTH, FAM_SD_720x480, in));
-        }
+    // A 576 VIC up while the line-count evidence rules 576 out moves to the width's 480-line
+    // family: a frozen Xcalibur 0x05/0x06/0x12 -> 0x02/0x0F keeps 27.000 MHz and the detector is
+    // blind there -- VIC 17/18/21/22 stayed for good; a wide 480-line raster can land on VIC 21/22 through hw_narrow_576's
+    // family-only match (Conexant 0x04/0x10, ~27.56 MHz), or follow a 640x576 apply (Focus
+    // PAL-60 720x480, 29.455 MHz).
+    if (in->width_confirmed && in->pclk_stable && !(c->lines & ARB_LINES_576) &&
+        arb_family_of_vic(in->active_vic) == FAM_SD_720x576) {
+        return arb_done(out, arb_pick_family(ARB_SRC_WIDTH, in->width_wide ? FAM_SD_720x480 : FAM_SD_640, in));
+    }
+    if (in->width_confirmed && in->width_wide && vic_is_576i(in->active_vic)) {
+        // The width flips with the raster, ahead of the clock: hold for a settled one to test
+        // the line count against (a Focus PAL-60 720x480 went out as VIC 17 at pclk 0).
+        if (!in->pclk_stable) return arb_done(out, arb_hold());
         return arb_done(out, arb_pick_family(ARB_SRC_WIDTH, FAM_SD_720x576, in));
     }
 
@@ -886,8 +894,7 @@ static vic_decision_t arb_level_blind(const arb_snapshot_t *in, arb_state_t *st,
     // Runs on effective_blind, so an untrusted reading gets the same region/width/clock
     // resolution as a truly blind one.
     if (c->effective_blind) {
-        if (st->blind_since == 0) st->blind_since = in->now_ms;
-        else if ((in->now_ms - st->blind_since) >= ARB_BLIND_TIMEOUT_MS) {
+        if (held_for(&st->blind_since, in->now_ms, ARB_BLIND_TIMEOUT_MS)) {
             // Hold rather than fall back to SD while the signal is really HD: a stable HD
             // clock (720p <-> 1080i share 74.25 MHz and go briefly blind), or an HD mode with
             // no confirmed drop to an SD clock yet (e.g. after a relock re-arms pclk_stable).
@@ -934,13 +941,16 @@ static vic_decision_t arb_level_blind(const arb_snapshot_t *in, arb_state_t *st,
             bool cx_pal576_plausible = in->encoder_id != ENCODER_CONEXANT ||
                                        in->tmds_cycle_busy || in->pclk_hz == 0 ||
                                        in->pclk_hz >= ARB_CONEXANT_PAL576_PCLK_MIN_HZ;
-            // hold_576 also releases on an aspect change within 576p while blind.
+            // hold_576 also releases on an aspect change within 576p while blind, and on a
+            // confirmed narrow width: 576p is 720-wide, and a 640x576 mode can share its clock
+            // (Focus 0x06 -> 0x12, both 27.000 MHz, held 720x576 for good).
             bool ws_576, ana_576;
             arb_resolve_aspect(FAM_SD_720x576, in, -1, &ws_576, &ana_576);
             bool aspect_agrees_576 = (vic_is_16_9(in->active_vic) == ws_576);
             bool hold_576 = pal50_classifiable &&
                             c->region == ARB_REGION_PAL50 && active_is_576p && !clk_in_bg_hybrid_win &&
                             cx_pal576_plausible && aspect_agrees_576 &&
+                            !(in->width_confirmed && !in->width_wide) &&
                             c->pal50_dbnc != VIC_03_480p_60_16_9 &&
                             c->pal50_dbnc != VIC_01_VGA_640x480_4_3;
             // The PAL50 verdict can stay VIC 0 forever for a clock outside its profiled bands.
@@ -948,8 +958,8 @@ static vic_decision_t arb_level_blind(const arb_snapshot_t *in, arb_state_t *st,
             // then fall through to the fallback (a hold on a settled verdict is fine and stays).
             bool holding_on_pal50 = (hold_480 || hold_576) && c->pal50_dbnc == VIC_00_VIC_Unavailable;
             if (holding_on_pal50) {
-                if (st->hold_stuck_since == 0) st->hold_stuck_since = in->now_ms;
-                else if ((in->now_ms - st->hold_stuck_since) >= ARB_HOLD_STUCK_TIMEOUT_MS) {
+                st->verdict_pending = true;   // the verdict may yet move the mode
+                if (held_for(&st->hold_stuck_since, in->now_ms, ARB_HOLD_STUCK_TIMEOUT_MS)) {
                     hold_480 = false;
                     hold_576 = false;
                     st->hold_stuck_escaped = true;
@@ -958,17 +968,37 @@ static vic_decision_t arb_level_blind(const arb_snapshot_t *in, arb_state_t *st,
                 st->hold_stuck_since = 0;
                 st->hold_stuck_escaped = false;
             }
+            // A settled HD clock and the encoder's own registers name the HD mode: that one.
+            // The clock can't tell 720p from 1080i, and holding put nothing at all out on a
+            // frozen boot into HD (seen on Focus).
+            // Not over the detector's own reading of the active mode while the register still
+            // holds what it held then: a sniffer that lost Focus's 0x92 write kept 720p's, and
+            // a blind blink after the detector's 1080i put 720p out for good.
+            if (clock_says_hd && in->enc_hd_vic && in->enc_hd_vic != in->active_vic &&
+                !(st->hd_det_vic == in->active_vic && st->hd_det_enc == in->enc_hd_vic)) {
+                return arb_pick(ARB_SRC_BLIND_FALLBACK, in->enc_hd_vic, true, false, in);
+            }
             if (clock_says_hd || (active_is_hd && !c->sd_clock_confirmed) ||
                 hold_480 || hold_576) {
+                // Holding, the candidate isn't refreshed: left over from before (an aspect write
+                // since), it kept stand_alone_settled() false for good, and a deferred clock-band
+                // re-apply never went (0x0E's row stayed on 0x04).
+                if (hold_480 || hold_576) st->blind_fb_cand_vic = 0;
                 return arb_hold();
             }
             bool fb_ws, fb_ana;
-            uint8_t fb_vic = arb_blind_fallback_vic(in, c->region, &fb_ws, &fb_ana);
+            uint8_t fb_vic = arb_blind_fallback_vic(in, c->region, c->lines, &fb_ws, &fb_ana);
             // Latch: a new candidate must hold for ARB_BLIND_FALLBACK_HOLD_MS. It is frozen
             // during our own TMDS cycle (busy, clock 0) and until the clock is stable -- before
             // that arb_pal50_sd_vic() can't classify, and the crude guess got applied before
             // the real verdict (seen on Conexant PAL). Nothing is output before the
             // first commit of a blind episode.
+            // Back to Auto since the latch committed (a defaults reset): its aspect was the old
+            // setting's, and put the old 4:3 out a debounce ahead of Auto's 16:9. It
+            // re-commits once the live guess has held.
+            if (in->user_aspect == ARB_ASPECT_AUTO && st->blind_fb_aspect != ARB_ASPECT_AUTO) {
+                st->blind_fb_valid = false;
+            }
             if (!in->tmds_cycle_busy && in->pclk_hz > 0 && in->pclk_stable) {
                 if (fb_vic != st->blind_fb_cand_vic || fb_ws != st->blind_fb_cand_ws ||
                     fb_ana != st->blind_fb_cand_ana) {
@@ -981,20 +1011,33 @@ static vic_decision_t arb_level_blind(const arb_snapshot_t *in, arb_state_t *st,
                     st->blind_fb_vic = fb_vic;
                     st->blind_fb_ws = fb_ws;
                     st->blind_fb_ana = fb_ana;
+                    st->blind_fb_aspect = (uint8_t)in->user_aspect;
                 }
+            }
+            // The live verdict already matches the screen: nothing to change. The latch only
+            // debounces changes, and its older value must not undo one already made -- a
+            // settings re-apply (scan, colour, wire VIC) puts a new aspect on before the latch
+            // catches up, and applying the latch brought the old aspect back (new -> old -> new
+            // on 640x480).
+            if (fb_vic == in->active_vic && fb_ana == in->active_is_anamorphic) {
+                return arb_hold();
             }
             if (!st->blind_fb_valid) {
                 return arb_hold();
             }
+            // The latch debounces the raster guess, and the aspect with it: the encoder's live
+            // aspect moves mid mode set (Xcalibur 0x07). An explicit Aspect setting doesn't: it
+            // goes on the latched raster at once, whatever the live guess (still unsettled
+            // after a reconnect). The latched aspect put a pre-reconnect 4:3 back on 640x480
+            // after a 16:9 write landed while the clock settled (Focus).
             fb_vic = st->blind_fb_vic;
             fb_ws = st->blind_fb_ws;
             fb_ana = st->blind_fb_ana;
-            // Already on this VIC, only the aspect disagrees, and the signal is unobservable
-            // (blind, no stable clock): keep the picture rather than cycle every loop. Releases
-            // as soon as the signal is observable again.
-            if (fb_vic == in->active_vic && c->blind && !in->pclk_stable &&
-                fb_ana != in->active_is_anamorphic) {
-                return arb_hold();
+            if (in->user_aspect != ARB_ASPECT_AUTO) {
+                fb_vic = vic_pair_base(fb_vic);
+                fb_ws = in->user_aspect == ARB_ASPECT_16_9;
+                fb_ana = fb_ws && fb_vic == VIC_01_VGA_640x480_4_3;
+                if (fb_ws && !fb_ana) fb_vic++;   // the pair's 16:9 half (3, 18, 22)
             }
             return arb_pick(ARB_SRC_BLIND_FALLBACK, fb_vic, fb_ws, fb_ana, in);
         }
@@ -1010,21 +1053,21 @@ static vic_decision_t decide_target_vic_impl(const arb_snapshot_t *in, arb_state
     arb_ctx_t c;
     arb_assess(in, st, &c);
     vic_decision_t d;
+    st->verdict_pending = false;
     if (arb_level_bios(in, st, &c, &d)) return d;
-    st->bios_pending_since = 0;
     if (arb_level_path_a(in, st, &c, &d)) return d;
     if (arb_level_hw_vic(in, st, &c, &d)) return d;
     if (arb_level_width(in, st, &c, &d)) return d;
-    if (arb_level_width_576(in, st, &c, &d)) return d;
+    if (arb_level_width_576(in, &c, &d)) return d;
     return arb_level_blind(in, st, &c);
 }
 
 
-bool arb_clock_contradicts_active_family(const arb_snapshot_t *in, const arb_state_t *st) {
+bool arb_clock_contradicts_active_family(const arb_snapshot_t *in) {
     const mode_family_t active = arb_family_of_vic(in->active_vic);
     // Known PAL50 console: the PAL50 classifier (480 vs 576, narrow vs wide). Only there --
     // its bands are PAL-only.
-    if (arb_region(in, st) == ARB_REGION_PAL50) {
+    if (arb_region(in) == ARB_REGION_PAL50) {
         mode_family_t now = arb_family_of_vic(arb_pal50_sd_vic(in));
         return now != FAM_NONE && now != active;
     }
@@ -1038,65 +1081,12 @@ bool arb_clock_contradicts_active_family(const arb_snapshot_t *in, const arb_sta
            (active == FAM_SD_720x480 && !in->width_wide);
 }
 
-// Public entry: decide_target_vic_impl() plus two things every decision passes through.
+// Public entry: decide_target_vic_impl(), and on an apply -- unless the blind fallback made it
+// -- the end of any blind episode: its latch is cleared (L6 clears it itself).
 vic_decision_t decide_target_vic(const arb_snapshot_t *in, arb_state_t *st) {
     vic_decision_t d = decide_target_vic_impl(in, st);
-    // Early-aspect skip. A mode set announces the new raster before the picture changes
-    // (Xcalibur's raster registers, ahead of its 0x07 aspect; Conexant's WSS, ~10 ms ahead of
-    // H_ACTIVE in the same burst; Focus resets its WSS to the 525-line 4:3 default at the
-    // start of the burst, ahead of IHO, and writes the real aspect last -- every switch out of
-    // 16:9 read 4:3 first). An aspect-only apply decided in that window would
-    // re-aspect the OLD raster and the real apply follow moments later. When the encoder says
-    // a new raster is coming, skip it -- the real apply carries the aspect. Genuine
-    // aspect-only switches apply at once; ARB_EARLY_ASPECT_MAX_MS bounds it so a misread
-    // signal can never block one.
-    const uint32_t now = in->now_ms;
-    if (in->encoder_id == ENCODER_XCALIBUR && in->xcal_mode_index != st->xcal_idx_last) {
-        st->xcal_idx_last = in->xcal_mode_index;
-        st->early_aspect_since = now;
-    }
-    const bool has_width_reg = in->encoder_id == ENCODER_CONEXANT || in->encoder_id == ENCODER_FOCUS;
-    if (has_width_reg && in->enc_ws_valid &&
-        (!st->wss_seen || in->enc_widescreen != st->wss_last)) {
-        if (st->wss_seen) {
-            st->width_epoch_at_wss = in->width_reg_epoch;
-            st->early_aspect_since = now;
-        }
-        st->wss_seen = true;
-        st->wss_last = in->enc_widescreen;
-    }
-    if (d.apply && st->early_aspect_since != 0 &&
-        (now - st->early_aspect_since) < ARB_EARLY_ASPECT_MAX_MS &&
-        arb_family_of_vic(d.target_vic) == arb_family_of_vic(in->active_vic)) {
-        if (in->encoder_id == ENCODER_XCALIBUR && in->xcal_mode_index != 0 &&
-            in->xcal_mode_index != st->xcal_idx_at_apply) {
-            const mode_family_t idx_fam = xbox_mode_family(in->xcal_mode_index, in->encoder_id);
-            if (idx_fam != FAM_NONE && idx_fam != arb_family_of_vic(in->active_vic)) {
-                return arb_hold();
-            }
-        }
-        if (has_width_reg) {
-            // Focus writes IHO before its final WSS, so only its burst-start reset (4:3) can
-            // precede this burst's width write; a change to 16:9 is already the last write.
-            if (in->width_reg_epoch == st->width_epoch_at_wss &&
-                (in->encoder_id != ENCODER_FOCUS || !in->enc_widescreen) &&
-                (now - st->early_aspect_since) < ARB_CX_BURST_WAIT_MS) {
-                return arb_hold();   // this burst's width register not written yet
-            }
-            if (st->width_reg_at_apply != 0 && in->width_reg != st->width_reg_at_apply) {
-                return arb_hold();   // new raster coming
-            }
-        }
-    }
-    // Every return path passes here. On an apply: record the raster signals it was made on
-    // (the early-aspect skip above compares against them), and -- unless the blind fallback
-    // made it -- end any blind episode by clearing that latch (L6 clears it itself).
-    if (d.apply) {
-        st->xcal_idx_at_apply = in->xcal_mode_index;
-        st->width_reg_at_apply = in->width_reg;
-        if (d.source != ARB_SRC_BLIND_FALLBACK) {
-            arb_clear_blind_fallback(st);
-        }
+    if (d.apply && d.source != ARB_SRC_BLIND_FALLBACK) {
+        arb_clear_blind_fallback(st);
     }
     return d;
 }

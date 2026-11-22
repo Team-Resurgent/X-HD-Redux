@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 #ifndef __XBOX_VIDEO_BIOS_H__
 #define __XBOX_VIDEO_BIOS_H__
 
@@ -6,16 +7,8 @@
 #include "../shared/types.h"
 #include "../shared/xbox_video_timing.h"
 
-typedef enum {
-    VIDEO_REGION_NTSCM = 0x00000100,
-    VIDEO_REGION_NTSCJ = 0x00000200,
-    VIDEO_REGION_PAL_I = 0x00000300,
-    VIDEO_REGION_PAL_M = 0x00000400
-} video_region;
-
-// Mode Bitfields
+// Mode dword bit: 16:9 for SD modes (HD is 16:9 by format; the 480p modes never set it).
 #define XBOX_VIDEO_MODE_BIT_WIDESCREEN 0x10000000
-#define XBOX_VIDEO_MODE_BIT_SCART      0x20000000 // RGB
 
 // avinfo bit 16: toggles per title on consoles that populate avinfo (e.g. Focus), even where
 // mode bit 28 doesn't -- the 480p aspect fallback in bios_resolve_mode().
@@ -40,6 +33,17 @@ uint32_t bios_last_mode_dword(void);
 // Use this to make a setting take effect -- forcing the standalone path would replace a
 // BIOS-controlled mode with an autodetected guess.
 void reapply_active_mode(const xbox_encoder xb_encoder);
+
+// A setting changed: re-apply the active mode once the picture is settled (no packet
+// pending, no standalone decision under way, no TMDS cycle, a stable clock) -- or not at
+// all if an apply comes first, since it already uses the setting. Run by bios_loop().
+void request_reapply(void);
+// Drops a queued request: the console's signal went, and the next picture's apply takes the
+// current settings.
+void cancel_reapply(void);
+// Carries out a request_reapply() once the picture is settled. Run after the pass's mode
+// decisions (video_supervisor_step()), so an apply they make counts first.
+void service_reapply(const xbox_encoder xb_encoder);
 
 // Resolves and applies a mode dword now (reapplies, the `m` CLI command). False for an
 // unsupported mode_index.
